@@ -144,6 +144,8 @@ def ensure_parents(entries, path: str):
 
 def inject_file(entries, path, data: bytes, mode=0o100755):
     ensure_parents(entries, path)
+    # 仓库 core.autocrlf 会把脚本检出成 CRLF；带 \r 的 shebang 在 initramfs 里跑不起来。
+    data = data.replace(b"\r\n", b"\n")
     target = path.strip("/")
     for e in entries:
         if e["name"].rstrip("/") == target:
