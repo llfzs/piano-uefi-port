@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "description": "本机固件实际使用的 ESP 契约（从设备上读出来的，不是推测）。port-stage-esp.py 那套 SUNUEFI-LINUXv2 布局与本机固件不兼容，必须走 port-native-esp.py。",
+  "device": "Xiaomi Pad 8 Pro (piano, SM8750P)",
+  "esp": {
+    "directory": "\\EFI\\Piano\\stable",
+    "files": ["Image", "board.dtb", "initramfs", "boot.img"],
+    "capacity_bytes": 536870912,
+    "boot_img": {
+      "format": "android-boot-v2",
+      "page_size": 4096,
+      "kernel_addr": "0x10008000",
+      "ramdisk_addr": "0x11000000",
+      "tags_addr": "0x10000100",
+      "dtb_size": 0,
+      "dtb_addr": "0x0",
+      "cmdline": "",
+      "note": "DTB 与 cmdline 都不在 boot.img 里；固件从 board.dtb 与内置 cmdline 取"
+    }
+  },
+  "firmware_cmdline": "console=tty0 loglevel=4 consoleblank=0 fbcon=font:TER16x32 rdinit=/pianoinit piano.root=LABEL=PIANOROOT rootfstype=ext4 rootwait ro pd_ignore_unused clk_ignore_unused panic=0 iommu.passthrough=1",
+  "firmware_cmdline_is_compiled_in": true,
+  "partitions": {
+    "esp": {"partlabel": "sunuefi_esp", "fat_label": "SUNUEFI_ESP", "bytes": 536870912},
+    "root": {"partlabel": "sunuefi_root", "label": "PIANOROOT", "filesystem": "ext4", "bytes": 106837311488},
+    "policy": "只写这两块分区的内容，不改 GPT、不动 userdata"
+  },
+  "upstream": {
+    "repo": "yzddmr6/xiaomipad-8pro-mainline",
+    "tag": "v1.0.0",
+    "kernel_release": "7.2.14-piano56",
+    "sources": {
+      "kernel": "boot/boot.img 的 Android header v4 kernel 段（43885056B，MZ / EFI Stub）",
+      "dtb": "boot/piano-boot.dtb（147424B，完整合并 FDT）",
+      "initramfs": "boot/vendor_boot.img 的 vendor_ramdisk（zstd，解压 136MB，systemd initrd）",
+      "not_sources": "boot/init_boot.img 的 ramdisk 只有 48B（空 cpio），不能用"
+    }
+  },
+  "injected": {
+    "/pianoinit": "把固件的 piano.root= 翻译成 root=、ro 改成 rw，再 exec 上游 /init",
+    "/usr/libexec/piano/piano-root-fixup": "首次启动注释 fstab 里的 linux_rootfs/linux_data 并补 /home",
+    "/usr/lib/systemd/system/piano-root-fixup.service": "挂在 initrd-root-fs.target，After=sysroot.mount"
+  },
+  "why_not_port_stage_esp": "port-stage-esp.py 产出 SUNUEFI-LINUXv2 单文件 payload 与 Image.efi 命名；本机固件读四文件 Android boot v2 布局。混用会直接开不了机。"
+}
