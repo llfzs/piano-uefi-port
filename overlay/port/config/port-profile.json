@@ -1,0 +1,85 @@
+{
+  "schema": 2,
+  "description": "Piano UEFI 移植桥接配置：源仓库(xiaomipad-8pro-mainline) 构建产物 -> SunUEFI ESP/分区/三产物契约。UEFI 全部落在 port/ 子树，零上游文件修改。",
+  "upstream": {
+    "integration_repo": "yzddmr6/xiaomipad-8pro-mainline",
+    "kernel_repo": "yzddmr6/linux-sm8750-piano",
+    "kernel_version": "7.2.14-piano56",
+    "sync": "port/config/upstream-sync.json",
+    "note": "内核与硬件用户态沿用源仓库；只替换引导/分区/切换三层，且全部在 port/ 内完成后处理，不改上游源码。"
+  },
+  "sunuefi": {
+    "loader": "uefi/components/linux-loader/LinuxRamBoot.c",
+    "boot_request": "uefi/handoff/bootselect/BootRequest.c",
+    "android_module": "android/module",
+    "esp_boot_path": "\\EFI\\Piano\\stable\\boot.img",
+    "payload_magic": "SUNUEFI-LINUXv2",
+    "payload_header_bytes": 144
+  },
+  "partitions": {
+    "esp": {
+      "name": "sunuefi_esp",
+      "label": "SUNUEFI_ESP",
+      "partuuid": "5fd95c71-fea3-47af-b0df-29ca9994a23a",
+      "filesystem": "vfat",
+      "capacity_bytes": 536870912
+    },
+    "root": {
+      "name": "sunuefi_root",
+      "label": "PIANOROOT",
+      "partuuid": "ffc480ed-c219-400b-a8f9-5f6805aa1f34",
+      "filesystem": "ext4",
+      "capacity_bytes": 68182605824
+    },
+    "root_label": "PIANOROOT",
+    "root_policy": "LABEL=PIANOROOT",
+    "android_userdata": "不动（SunUEFI 方案不重排 userdata，不清空 Android 数据）"
+  },
+  "esp_layout": {
+    "stable/Image.efi": "源仓库 build-kernel.sh 产出的 arch/arm64/boot/Image（须为 EFI Stub 内核）",
+    "stable/piano.dtb": "源仓库 prepare-boot-dtb.py 产出的 piano-boot.dtb（完整合并 FDT）",
+    "stable/initramfs.cpio.gz": "源仓库 build-initramfs.sh 产出的 initramfs（须能认 piano.root=）",
+    "stable/config": "内核 cmdline，含 root= 与 piano.root= 双兼容参数",
+    "stable/boot.img": "SUNUEFI-LINUXv2 payload（给 RAM loader / 合体 BOOT）",
+    "shared/dtb-manifest.json": "DTB 来源与 sha256 记录"
+  },
+  "cmdline_template": "root=PARTUUID={root_partuuid} piano.root=PARTUUID={root_partuuid} rw rootwait console=tty0 earlycon clk_ignore_unused pd_ignore_unused initcall_debug=0",
+  "kernel_config_requirements": [
+    "CONFIG_EFI=y",
+    "CONFIG_EFI_STUB=y",
+    "CONFIG_EFI_GENERIC_STUB=y",
+    "CONFIG_ARM64=y",
+    "CONFIG_ARCH_QCOM=y"
+  ],
+  "login": {
+    "user": "piano",
+    "password": "piano",
+    "root_password": "piano",
+    "autologin": true,
+    "hash_method": "sha512-crypt ($6$)",
+    "note": "账号 piano、密码 piano、root 密码 piano、GDM 自动登录。注入在 rootfs 产物后处理阶段完成，绕过源仓库 build-rootfs-image.py 的 no_user_accounts/root_password_locked 构建期校验。对齐 SunUEFI config/release.json login 段（其默认 piano123456，本项目改为 piano）。"
+  },
+  "artifacts": {
+    "SunUEFI-Module": {
+      "file": "SunUEFI-Piano-{version}.zip",
+      "source": "SunUEFI android/module + native（build_android_product_module.py 产物）",
+      "content": "Android 引导助手模块：创建 sunuefi_esp/sunuefi_root、刷镜像、写 BootRequest 切换"
+    },
+    "SunUEFI-ESP": {
+      "file": "esp.sparse.img",
+      "source": "port-stage-esp.py 产出的 ESP 目录 -> FAT32 -> android sparse",
+      "content": "各发行版共用的启动镜像（UEFI 从 sunuefi_esp 加载 Linux）"
+    },
+    "SunUEFI-Root": {
+      "file": "root-{distro}.sparse.img",
+      "source": "源仓库 root.sparse.img / root.ext4 + port-inject-login.py + port-adapt-rootfs.py 后处理",
+      "content": "对应发行版的系统镜像（挂 sunuefi_root，预置 piano/piano 账号）"
+    },
+    "distros_config": "port/config/distros.json"
+  },
+  "contract_gap": {
+    "id": "ROOTFS_MOUNT_CONTRACT",
+    "problem": "源仓库 initramfs 认标准 root=；SunUEFI ram-bootstrap/initramfs 认 piano.root=。两者 init 脚本契约不同。",
+    "resolution": "桥接脚本生成 cmdline 同时携带 root= 与 piano.root=；并在 rootfs 写入 SunUEFI 的 etc/piano/root-policy.json 与 fstab。真机前须确认 initramfs 的 init 能按其中之一挂载 sunuefi_root，详见 docs/PORTING-MAP.md 的 G1。"
+  }
+}

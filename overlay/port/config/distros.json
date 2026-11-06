@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "description": "发行版构建矩阵：源仓库只产出 Ubuntu 26.04 rootfs；保留扩展位以便将来接 SunUEFI 的多发行版。产物名严格对齐 SunUEFI build-products.yml 的 SunUEFI-Root-<target>。",
+  "default": "ubuntu-gnome",
+  "distros": [
+    {
+      "target": "ubuntu-gnome",
+      "artifact": "SunUEFI-Root-ubuntu-gnome",
+      "root_image": "root-ubuntu-gnome.sparse.img",
+      "source": "xiaomipad-8pro-mainline / ubuntu/root-image.json (Ubuntu 26.04 Desktop)",
+      "rootfs_builder": "tools/build-rootfs-image.py",
+      "desktop": "gnome",
+      "enabled": true,
+      "note": "唯一启用项：直接消费源仓库勤快维护的 Ubuntu 26.04 根系统"
+    },
+    {
+      "target": "debian-gnome",
+      "artifact": "SunUEFI-Root-debian-gnome",
+      "root_image": "root-debian-gnome.sparse.img",
+      "source": "Project-SunUEFI / debian-piano-current",
+      "rootfs_builder": "sunuefi:tools/build_release_rootfs.py",
+      "desktop": "gnome",
+      "enabled": false,
+      "note": "扩展位：需以 git subtree 引入 SunUEFI 后启用，见 docs/PORTING-MAP.md"
+    },
+    {
+      "target": "debian-kde",
+      "artifact": "SunUEFI-Root-debian-kde",
+      "root_image": "root-debian-kde.sparse.img",
+      "source": "Project-SunUEFI / debian-piano-current",
+      "rootfs_builder": "sunuefi:tools/build_release_rootfs.py",
+      "desktop": "kde",
+      "enabled": false,
+      "note": "扩展位"
+    },
+    {
+      "target": "nyarch-gnome",
+      "artifact": "SunUEFI-Root-nyarch-gnome",
+      "root_image": "root-nyarch-gnome.sparse.img",
+      "source": "Project-SunUEFI / nyarch",
+      "rootfs_builder": "sunuefi:tools/build_nyarch_rootfs.py",
+      "desktop": "gnome",
+      "enabled": false,
+      "note": "扩展位"
+    },
+    {
+      "target": "steamos",
+      "artifact": "SunUEFI-Root-steamos",
+      "root_image": "root-steamos.sparse.img",
+      "source": "Project-SunUEFI / SteamOS-ARM-Port",
+      "rootfs_builder": "sunuefi:tools/build_steamos_rootfs.py",
+      "desktop": "gamescope",
+      "enabled": false,
+      "note": "扩展位"
+    }
+  ],
+  "shared_artifacts": ["SunUEFI-Module", "SunUEFI-ESP"],
+  "note": "Module 与 ESP 全发行版共用，只在矩阵首个 target 上传一次（对齐 SunUEFI 的 shared_target 机制）。"
+}

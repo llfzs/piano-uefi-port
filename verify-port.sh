@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# 离线校验：移植骨架结构 + 脚本语法 + YAML + 合成输入自检 + 隔离校验。
+# 不编译、不联网、不刷机。
+# 用法：
+#   ./verify-port.sh                       # 校验工程包自身（KIT 模式）
+#   ./verify-port.sh <已 apply 的工作树>    # 复检落地
+#   bash port/verify-port.sh .             # 从 fork 子树内被调用（merge 后自检）
+set -euo pipefail
+SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
+fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1" >&2; exit 1; }
+
+# 判定模式：KIT 模式（存在 overlay/）还是 SUBTREE 模式（自身就是 port/ 的父目录）
+KIT=""; TARGET=""
+if [ -d "$SELF/overlay/port" ]; then
+  KIT="$SELF"
+  [ -n "${1:-}" ] && TARGET="$1"
+else
+  # 从 fork 内调用：SELF 可能是 <fork>/port，KIT 工具都在自身
+  TARGET="$(cd "$SELF/.." && pwd)"
+fi
+
+# 定位 port 根与 tools
+if [ -n "$KIT" ]; then
+  PORTROOT="$KIT/overlay/port"
+else
+  PORTROOT="$(cd "$(dirname "$SELF")" && pwd)"   # 期望是 <fork>/port 的父
+  [ -d "$SELF/tools" ] && PORTROOT="$SELF"
+fi
+[ -d "$PORTROOT/tools" ] || fail "找不到 port/tools（PORTROOT=$PORTROOT）"
+
+echo "=== 1. 关键文件齐全 ==="
+for f in \
+  config/port-profile.json config/distros.json config/upstream-sync.json config/release-policy.json \
+  tools/port-stage-esp.py tools/port-adapt-rootfs.py tools/port-partition-plan.py \
+  tools/port-inject-login.py tools/port-package-artifacts.py tools/port-release-assets.py \
+  tools/port-check-isolation.py tools/port-sync-upstream.sh tools/port-switch.sh \
+  build/port-build.sh \
+  docs/PORTING-MAP.md docs/REQUIREMENTS.md docs/SYNC-UPSTREAM.md docs/RELEASE.md; do
+  [ -f "$PORTROOT/$f" ] || fail "缺文件 port/$f"
+done
+pass "port/ 关键文件齐全（含需求 3/4/5/7 新增脚本与文档）"
+
+echo "=== 2. Python / Shell 语法 ==="
+python3 - "$PORTROOT" <<'PY' || fail "python 语法错误"
+import ast, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+files = list((root/'tools').glob('*.py'))
+tests = root/'tests/selftest.py'
+if tests.exists(): files.append(tests)
+for p in files:
+    ast.parse(p.read_text(), filename=str(p))
+print(f"  parsed {len(files)} python files")
+PY
+bash -n "$PORTROOT"/tools/*.sh "$PORTROOT"/build/*.sh 2>/dev/null || fail "shell 语法错误"
+if [ -n "$KIT" ]; then
+  bash -n "$KIT"/apply-port.sh "$KIT"/verify-port.sh || fail "顶层 shell 语法错误"
+fi
+pass "脚本语法合法"
+
+echo "=== 3. JSON 配置合法 + 需求字段断言 ==="
+python3 - "$PORTROOT" <<'PY' || fail "配置校验失败"
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+prof = json.loads((root/'config/port-profile.json').read_text())
+dist = json.loads((root/'config/distros.json').read_text())
+sync = json.loads((root/'config/upstream-sync.json').read_text())
+rel = json.loads((root/'config/release-policy.json').read_text())
+# 需求 2
+assert prof['partitions']['esp']['name'] == 'sunuefi_esp'
+assert prof['partitions']['root']['name'] == 'sunuefi_root'
+assert prof['partitions']['root_label'] == 'PIANOROOT'
+# 需求 5
+assert prof['login']['user'] == 'piano'
+assert prof['login']['password'] == 'piano'
+assert prof['login']['root_password'] == 'piano'
+assert prof['login']['autologin'] is True
+# 需求 4
+assert all(k in prof['artifacts'] for k in ('SunUEFI-Module','SunUEFI-ESP','SunUEFI-Root'))
+assert any(d['enabled'] for d in dist['distros'])
+# 需求 3
+assert 'port/' in sync['port_owned_namespaces']
+assert any('sunuefi-' in n for n in sync['port_owned_namespaces'])
+# 需求 7：发布策略
+assert rel['tag_prefix'] == 'v' and rel['tag_trigger_glob'] == 'v*'
+assert rel['clobber'] is True
+assert 'SunUEFI-Module.zip' in rel['upload_files']
+assert any(x.startswith('SunUEFI-Root-') for x in rel['upload_files'])
+assert len(rel['required_artifacts']) == 3
+assert 'port/tools/port-release-assets.py' in sync['isolation_rules']['protected_port_files']
+print('  profile/distros/sync/release-policy 需求字段 OK')
+PY
+pass "配置合法（分区/账号/产物/同步/发布字段）"
+
+echo "=== 4. GitHub Actions YAML 结构 + 三产物 + 需求 7 发布链路 ==="
+WF=""
+if [ -n "$KIT" ]; then WF="$KIT/overlay/.github/workflows"; else WF="$(dirname "$PORTROOT")/.github/workflows"; fi
+if [ -d "$WF" ]; then
+  python3 - "$WF" <<'PY' || fail "workflow YAML 校验失败"
+import sys, glob
+from pathlib import Path
+try:
+    import yaml
+except ImportError:
+    yaml = None
+wf = Path(sys.argv[1])
+files = sorted(glob.glob(str(wf/'sunuefi-*.yml')))
+assert files, "没有 sunuefi-*.yml"
+names = [Path(f).name for f in files]
+for f in files:
+    name = Path(f).name
+    assert name.startswith('sunuefi-'), f"workflow 缺前缀: {name}"
+    text = Path(f).read_text()
+    assert 'jobs:' in text, f"{name} 缺 jobs"
+    if yaml:
+        d = yaml.safe_load(text)
+        assert isinstance(d, dict) and 'jobs' in d, f"{name} 缺 jobs"
+# 需求 6：三个 artifact 名
+build_text = (wf/'sunuefi-build.yml').read_text()
+for token in ('name: SunUEFI-Module', 'name: SunUEFI-ESP', 'SunUEFI-Root-${{ matrix.target }}'):
+    assert token in build_text, f"构建 workflow 缺 {token}"
+# 需求 7：tag 触发 / publish job / 发布链路 / 权限
+assert 'sunuefi-release.yml' in names, '缺手动补发 workflow'
+for token in ('tags:', 'v*', 'publish_release:', 'publish:', 'port-release-assets.py',
+              'pattern: SunUEFI-*', 'gh release', '--clobber', 'contents: write'):
+    assert token in build_text, f"构建 workflow 缺需求 7 要素: {token}"
+if yaml:
+    bd = yaml.safe_load(build_text)
+    assert 'publish' in bd['jobs'], 'publish job 解析失败'
+    assert bd['jobs']['publish']['permissions']['contents'] == 'write'
+    assert bd['jobs']['publish']['needs'] == ['select', 'build']
+# 手动补发 workflow：复用已有 run、不重新编译
+rel_text = (wf/'sunuefi-release.yml').read_text()
+for token in ('workflow_dispatch:', 'gh run download', 'port-release-assets.py'):
+    assert token in rel_text, f"补发 workflow 缺 {token}"
+# 同步 workflow：可选同步后打发布 tag
+assert 'release_tag_after_sync' in (wf/'sunuefi-sync-upstream.yml').read_text()
+print(f'  {len(files)} 个 workflow：三产物 + publish/补发/同步打 tag 校验通过')
+PY
+  pass "Actions YAML（三产物命名 + 需求 7 发布链路）"
+else
+  echo "  (KIT 模式未落地 workflow？跳过)"
+fi
+
+echo "=== 5. 合成输入跑通全链路自检 ==="
+ST=""
+if [ -n "$KIT" ]; then ST="$KIT/tests/selftest.py"; ARG="$KIT"; else ST="$PORTROOT/tests/selftest.py"; ARG="$(dirname "$PORTROOT")"; fi
+if [ -f "$ST" ]; then
+  python3 "$ST" "$ARG" || fail "selftest 未通过"
+  pass "selftest 通过（ESP/payload/账号/三产物/Release 资产/隔离/分区）"
+else
+  echo "  (未找到 selftest.py，跳过)"
+fi
+
+echo "=== 6. 隔离校验（需求 3）==="
+if [ -n "$TARGET" ] && [ -d "$TARGET/port" ]; then
+  python3 "$PORTROOT/tools/port-check-isolation.py" --root "$TARGET" --mode tree --json >/dev/null \
+    || fail "目标树隔离校验失败"
+  pass "目标树隔离通过（可随时 merge upstream/main）"
+elif [ -z "$KIT" ]; then
+  python3 "$PORTROOT/tools/port-check-isolation.py" --root "$(dirname "$PORTROOT")" --mode tree --json >/dev/null \
+    || fail "子树隔离校验失败"
+  pass "子树隔离通过"
+else
+  echo "  (KIT 自检不包含目标树，apply 后传入路径复检)"
+fi
+
+echo ""
+echo "ALL CHECKS PASSED —— 结构/逻辑校验，不代表真机可启动；真机见 PORTING-MAP.md 第 6 节。"
