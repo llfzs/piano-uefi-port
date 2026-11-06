@@ -50,7 +50,15 @@
       "not_sources": "boot/init_boot.img 的 ramdisk 只有 48B（空 cpio），不能用"
     },
     "boot_img_cmdline": "root=PARTLABEL=linux_rootfs rootfstype=ext4 rw rootwait console=ttyMSM0,115200n8 log_buf_len=2M panic=15 msm.separate_gpu_kms=0 piano.boot=persistent systemd.gpt_auto=0 bootconfig",
-    "note": "上游走的是另一套加载器（cmdline 写在 boot header v4 里）；本机固件 cmdline 编译进固件，两套 cmdline 不能互换。"
+    "note": "上游走的是另一套加载器（cmdline 写在 boot header v4 里）；本机固件 cmdline 编译进固件，两套 cmdline 不能互换。",
+    "rootfs": {
+      "label": "linux_rootfs",
+      "uuid": "194d26a36c2d5b7a9f2b236e40486c86",
+      "size": "60.00 GiB（15728640 x 4096）",
+      "free": "51.1 GiB",
+      "sparse": "magic 0xED26FF3A，7483 chunk，文件 8461055508 B",
+      "note": "卷标是 linux_rootfs，与固件 cmdline 的 LABEL=PIANOROOT 不同，必须按 GPT 分区名定位根分区"
+    }
   },
   "injected": {
     "/pianoinit": "把固件的 piano.root= 翻译成 root=、ro 改成 rw，再 exec 上游 /init",
@@ -61,5 +69,12 @@
       "msm.separate_gpu_kms=0"
     ]
   },
-  "why_not_port_stage_esp": "port-stage-esp.py 产出 SUNUEFI-LINUXv2 单文件 payload 与 Image.efi 命名；本机固件读四文件 Android boot v2 布局。混用会直接开不了机。"
+  "why_not_port_stage_esp": "port-stage-esp.py 产出 SUNUEFI-LINUXv2 单文件 payload 与 Image.efi 命名；本机固件读四文件 Android boot v2 布局。混用会直接开不了机。",
+  "esp_image": {
+    "tool": "port/tools/native/make-esp-image.py",
+    "template": "原厂 ESP 整块 dd 备份，提供几何与目录项",
+    "geometry": "512 MiB / 4096 B 扇区 / 1 扇区每簇 / 保留 32 / 2 个 FAT / 每 FAT 128 扇区 / 卷标 SUNUEFI_ESP",
+    "size_bytes": 536870912,
+    "note": "几何非常规（mkfs.fat -S 4096），不自己排版式，沿用模板引导扇区与目录项"
+  }
 }

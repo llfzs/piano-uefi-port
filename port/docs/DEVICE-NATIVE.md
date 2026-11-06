@@ -82,9 +82,16 @@ systemd.gpt_auto=0 bootconfig
 流程原样保留。
 
 ```
-piano.root=LABEL=PIANOROOT  →  root=LABEL=PIANOROOT
+piano.root=LABEL=PIANOROOT  →  root=PARTLABEL=sunuefi_root
 ro                          →  rw
 ```
+
+**为什么要换成 `PARTLABEL`**：`LABEL=` 是 rootfs 自己的属性，换个发行版就变。本机
+Debian 的卷标确实是 `PIANOROOT`，但上游 Ubuntu 那份是 `linux_rootfs`。直接翻成
+`root=LABEL=PIANOROOT` 刷完就找不到根设备，内核在挂根文件系统时 panic。GPT 分区名
+`sunuefi_root` 是我们分区时写死的，与 rootfs 无关，两条路都能挂上。
+（`PARTLABEL=` 由 systemd-fstab-generator 解析成 `dev-disk-by-partlabel-*.device`，
+内核自己的 `name_to_dev_t` 也认，不依赖 `/dev/disk/by-label` 的符号链接时机。）
 
 再补两个上游 cmdline 里有、固件没有的开关（键已存在就不重复加）：
 
@@ -160,6 +167,36 @@ python3 port/tools/port-native-esp.py \
 前置：ESP 上**只有** `EFI/Piano/stable/` 这四个文件（实测，没有 `EFI/BOOT`），
 所以换 ESP 就是换这四个文件，不存在漏改别的引导项的问题。
 
+### 5.1 打包成可刷镜像（安卓模块 / fastboot）
+
+进不了 Linux、或者想从 Android 一次刷完时，把 ESP 打成**整分区 FAT32 镜像**：
+
+```sh
+python port/tools/native/make-esp-image.py \
+  --template esp-backup-orig.img \      # 原厂 ESP 整块备份，提供几何与目录项
+  --source   <native-esp 目录>  \
+  --output   sunuefi_esp.img
+```
+
+模板的作用是「不要自己排版式」：本机 ESP 是 **4 KiB 扇区**（`mkfs.fat -S 4096`）这种
+非常规几何，引导扇区、保留扇区、FSInfo 全部逐字节沿用模板；目录项也直接沿用模板里
+那一条（连同前面的长文件名项），只改文件大小和起始簇。这样长文件名、大小写、时间戳
+都和固件已经认得住的那份一致——换完用 pyfatfs 独立解析，目录表示与模板逐项相同，
+四个文件字节一致。
+
+产物正好 512 MiB，与分区等长，覆盖时不会留下旧文件的尾巴。
+
+刷入两选一：
+
+| 方式 | 命令 | 前提 |
+| --- | --- | --- |
+| 安卓模块存储页 | 选镜像 → 执行 | 模块 0.5.2+（认稀疏镜像）；root 镜像 8.46 GB 要放在 userdata 里，剩余空间得够 |
+| fastboot | `fastboot flash sunuefi_esp sunuefi_esp.img` | USB 进 bootloader；不占设备存储 |
+
+`sunuefi_root.sparse.img` 是 Android 稀疏镜像（magic `0xED26FF3A`，7483 个 chunk，
+展开 60.0 GiB，文件系统卷标 `linux_rootfs`）。fastboot 与新版模块都原生支持稀疏，
+不需要先展开成 60 GiB。
+
 1. **换 ESP**（在现有 Linux 里跑，需要 root）：
 
    ```sh
@@ -187,10 +224,9 @@ python3 port/tools/port-native-esp.py \
 
 ## 6. 回退
 
-- **ESP**：`sh port/tools/native/rollback-esp.sh /home/piano/esp-backup-<时间戳>`
-  （需要能进 Linux）。进不了 Linux 的话，只能从 Android 侧 fastboot 刷回完整 ESP 镜像——
-  而 `deploy-esp.sh` 只备份了四个文件，没有整块 `dd` 备份，所以**想留整块回退路径的
-  话，换 ESP 之前自己 `sudo dd if=/dev/sda35 of=esp-backup.img bs=1M` 存一份**。
+- **ESP**：进得去 Linux 就跑 `sh port/tools/native/rollback-esp.sh /home/piano/esp-backup-<时间戳>`
+  （只覆盖四个文件）；进不去就用整块备份 `fastboot flash sunuefi_esp esp-backup-orig.img`
+  （512 MiB 的 `dd if=/dev/sda35`，本轮已存，sha256 `d9c7eadefa539b87…`）。
 - **root**：上游镜像是 Android 稀疏镜像，`fastboot flash` 会覆盖整块分区，
   本机原 Debian（26 GB 已用）**不可逆丢失**，除非事先做过分区镜像。
 - 只想试内核不换 rootfs：不可行。`piano.root=` 编译在固件里，改不了指向。
