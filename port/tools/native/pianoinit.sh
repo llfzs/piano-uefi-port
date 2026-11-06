@@ -2,7 +2,8 @@
 # SunUEFI 固件的 cmdline 是编译进固件的，固定为：
 #     rdinit=/pianoinit piano.root=LABEL=PIANOROOT ... ro
 # 上游 Ubuntu 的 initramfs 由 systemd 驱动，只认标准 root=。
-# 这里只做两件事：把 piano.root= 翻译成 root=，把固件带的 ro 改成 rw，
+# 这里只做三件事：把 piano.root= 翻译成 root=（卷标换成 GPT 分区名）、
+# 把固件带的 ro 改成 rw，补两个上游有而固件没有的参数，
 # 然后把控制权交回上游 /init（PID 1 不变，systemd 照常接管）。
 #
 # 上游 initramfs 里没有 mountpoint（只有 util-linux 的 mount），也不保证有 sed，
@@ -19,6 +20,13 @@ for arg in $(cat /proc/cmdline); do
     esac
 done
 [ -n "$spec" ] || spec=LABEL=PIANOROOT
+
+# 固件给的是文件系统卷标 LABEL=PIANOROOT，但卷标是 rootfs 自己的属性，换个发行版
+# 就变了（上游 Ubuntu 那份是 linux_rootfs）。GPT 分区名 sunuefi_root 由我们自己
+# 分区时写死，与 rootfs 无关，所以按分区名定位，换任何 rootfs 都能挂上。
+case "$spec" in
+    LABEL=PIANOROOT|LABEL=pianoroot) spec=PARTLABEL=sunuefi_root ;;
+esac
 
 new=""
 have_root=0
