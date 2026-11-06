@@ -68,10 +68,10 @@ def make_synthetic_inputs(d: Path):
 def verify_password(hashed: str, password: str) -> bool:
     """用 crypt 或 openssl 反算校验 sha512-crypt 哈希。"""
     import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        import crypt as _crypt
     try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            import crypt as _crypt
         return _crypt.crypt(password, hashed) == hashed
     except (ImportError, AttributeError):
         r = subprocess.run(["openssl", "passwd", "-6", "-salt",
