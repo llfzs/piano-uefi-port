@@ -4,7 +4,12 @@
   "device": "Xiaomi Pad 8 Pro (piano, SM8750P)",
   "esp": {
     "directory": "\\EFI\\Piano\\stable",
-    "files": ["Image", "board.dtb", "initramfs", "boot.img"],
+    "files": [
+      "Image",
+      "board.dtb",
+      "initramfs",
+      "boot.img"
+    ],
     "capacity_bytes": 536870912,
     "boot_img": {
       "format": "android-boot-v2",
@@ -21,8 +26,17 @@
   "firmware_cmdline": "console=tty0 loglevel=4 consoleblank=0 fbcon=font:TER16x32 rdinit=/pianoinit piano.root=LABEL=PIANOROOT rootfstype=ext4 rootwait ro pd_ignore_unused clk_ignore_unused panic=0 iommu.passthrough=1",
   "firmware_cmdline_is_compiled_in": true,
   "partitions": {
-    "esp": {"partlabel": "sunuefi_esp", "fat_label": "SUNUEFI_ESP", "bytes": 536870912},
-    "root": {"partlabel": "sunuefi_root", "label": "PIANOROOT", "filesystem": "ext4", "bytes": 106837311488},
+    "esp": {
+      "partlabel": "sunuefi_esp",
+      "fat_label": "SUNUEFI_ESP",
+      "bytes": 536870912
+    },
+    "root": {
+      "partlabel": "sunuefi_root",
+      "label": "PIANOROOT",
+      "filesystem": "ext4",
+      "bytes": 106837311488
+    },
     "policy": "只写这两块分区的内容，不改 GPT、不动 userdata"
   },
   "upstream": {
@@ -34,12 +48,18 @@
       "dtb": "boot/piano-boot.dtb（147424B，完整合并 FDT）",
       "initramfs": "boot/vendor_boot.img 的 vendor_ramdisk（zstd，解压 136MB，systemd initrd）",
       "not_sources": "boot/init_boot.img 的 ramdisk 只有 48B（空 cpio），不能用"
-    }
+    },
+    "boot_img_cmdline": "root=PARTLABEL=linux_rootfs rootfstype=ext4 rw rootwait console=ttyMSM0,115200n8 log_buf_len=2M panic=15 msm.separate_gpu_kms=0 piano.boot=persistent systemd.gpt_auto=0 bootconfig",
+    "note": "上游走的是另一套加载器（cmdline 写在 boot header v4 里）；本机固件 cmdline 编译进固件，两套 cmdline 不能互换。"
   },
   "injected": {
     "/pianoinit": "把固件的 piano.root= 翻译成 root=、ro 改成 rw，再 exec 上游 /init",
     "/usr/libexec/piano/piano-root-fixup": "首次启动注释 fstab 里的 linux_rootfs/linux_data 并补 /home",
-    "/usr/lib/systemd/system/piano-root-fixup.service": "挂在 initrd-root-fs.target，After=sysroot.mount"
+    "/usr/lib/systemd/system/piano-root-fixup.service": "挂在 initrd-root-fs.target，After=sysroot.mount",
+    "cmdline_added": [
+      "systemd.gpt_auto=0",
+      "msm.separate_gpu_kms=0"
+    ]
   },
   "why_not_port_stage_esp": "port-stage-esp.py 产出 SUNUEFI-LINUXv2 单文件 payload 与 Image.efi 命名；本机固件读四文件 Android boot v2 布局。混用会直接开不了机。"
 }

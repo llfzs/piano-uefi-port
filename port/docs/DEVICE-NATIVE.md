@@ -24,11 +24,26 @@ page_size=4096  kernel_addr=0x10008000  ramdisk_addr=0x11000000  tags_addr=0x100
 header_version=2  dtb_size=0  cmdline=""
 ```
 
-固件 cmdline **编译在固件里**，ESP 里没有 cmdline 文件：
+固件 cmdline **编译在固件里**，ESP 里没有 cmdline 文件。设备上 `cat /proc/cmdline` 的实测值：
 
 ```
-rdinit=/pianoinit piano.root=LABEL=PIANOROOT rootfstype=ext4 rootwait ro ...
+console=tty0 loglevel=4 consoleblank=0 fbcon=font:TER16x32
+rdinit=/pianoinit piano.root=LABEL=PIANOROOT rootfstype=ext4 rootwait ro
+pd_ignore_unused clk_ignore_unused panic=0 iommu.passthrough=1
 ```
+
+注意这里**没有** `root=`，并且写死了 `ro`——两件事都得在 `/pianoinit` 里处理。
+
+上游 `boot.img` 走的是另一套加载器，cmdline 写在头部（v4）里，可以直接对照：
+
+```
+root=PARTLABEL=linux_rootfs rootfstype=ext4 rw rootwait console=ttyMSM0,115200n8
+log_buf_len=2M panic=15 msm.separate_gpu_kms=0 piano.boot=persistent
+systemd.gpt_auto=0 bootconfig
+```
+
+其中 `systemd.gpt_auto=0` 与 `msm.separate_gpu_kms=0` 会被 `/pianoinit` 补进去（见 3.1），
+其余属于他们那套加载器的自有开关，本机固件不认。
 
 ## 2. 与上游成品的三个硬冲突
 
@@ -42,6 +57,22 @@ rdinit=/pianoinit piano.root=LABEL=PIANOROOT rootfstype=ext4 rootwait ro ...
 （`kernel_size@8, ramdisk_size@12, os_version@16, header_size@20, header_version@40, cmdline@44`），
 不能套 v0–v2 的 `kernel_addr/ramdisk_addr/page_size` 布局。
 
+### 2.1 换了之后实际会掉什么
+
+| 项 | 上游 v1.0.0 | 本机当前 |
+| --- | --- | --- |
+| 内核 | `7.2.14-piano56` | `7.3.0-piano-sunuefi-cachy` |
+| `board.dtb` | 147 KB | 1.2 MB |
+| rootfs | Ubuntu（上游定制） | Debian 13 + GNOME |
+
+两点要知道：
+
+- **内核更老**。7.3.0 上的修复（UCSI 注销崩溃、PD 判定、快充认证、OTG 配置等）不在
+  7.2.14 里。要留在上游镜像上又想要这些修复，只能拿本机内核源码重编一份 Image 换进去。
+- **DTB 更小**。他们的 `board.dtb` 与他们内核是配套的，优先整对使用；若出现触摸/显示/
+  蓝牙异常，第一件事是拿本机的 1.2 MB `board.dtb` 配他们的内核做交叉验证，判断是
+  DTB 裁掉了节点还是内核缺驱动。
+
 ## 3. 注入的两个东西
 
 ### 3.1 `/pianoinit`（cmdline 翻译）
@@ -54,6 +85,19 @@ rdinit=/pianoinit piano.root=LABEL=PIANOROOT rootfstype=ext4 rootwait ro ...
 piano.root=LABEL=PIANOROOT  →  root=LABEL=PIANOROOT
 ro                          →  rw
 ```
+
+再补两个上游 cmdline 里有、固件没有的开关（键已存在就不重复加）：
+
+| 参数 | 原因 |
+| --- | --- |
+| `systemd.gpt_auto=0` | 别让 systemd 按分区类型自动生成挂载单元，fstab 只由我们修正 |
+| `msm.separate_gpu_kms=0` | 上游内核的显示路径按这个默认值验证过，缺了可能只有黑屏 |
+
+shim 里**只用 shell 内建语法**，因为上游 initramfs 里：
+
+- 没有 `mountpoint`（`util-linux` 只装了 `mount`）——所以用 `[ -r /proc/cmdline ]` 判断 `/proc`；
+- 不保证有 `sed`——所以用 `for` 循环重建 cmdline，而不是 `sed 's/ ro / rw /'`；
+- `/bin`、`/sbin`、`/lib` 都是指向 `usr/*` 的符号链接，`#!/bin/sh` 可以解析（`dash` 在 `/usr/bin/dash`）。
 
 ### 3.2 rootfs 首次启动修正单元
 
@@ -92,21 +136,43 @@ python3 port/tools/port-native-esp.py \
 
 ## 5. 上机流程
 
-1. **备份 ESP**：`sudo dd if=/dev/sda35 of=/home/piano/esp-backup.img bs=1M`；
-2. 复制四件套到 `/boot/efi/EFI/Piano/stable/`（覆盖前把原文件另存一份）；
-3. 重启进 fastboot，刷 `sunuefi_root`（上游 `root.sparse.img`，未压缩约 60 GiB 逻辑大小，
-   本机分区 99.5 GiB，容量足够）；
-4. 重启。
+前置：ESP 上**只有** `EFI/Piano/stable/` 这四个文件（实测，没有 `EFI/BOOT`），
+所以换 ESP 就是换这四个文件，不存在漏改别的引导项的问题。
+
+1. **换 ESP**（在现有 Linux 里跑，需要 root）：
+
+   ```sh
+   sh port/tools/native/deploy-esp.sh /path/to/native-esp/EFI/Piano/stable
+   ```
+
+   脚本先把整个 `stable/` 目录 `cp -a` 备份到 `/home/piano/esp-backup-<时间戳>`（附
+   `SHA256SUMS`），再覆盖，`sync` 后逐文件回读校验。
+
+2. **刷 root**（必须在 Android 侧用原厂 Fastboot，Linux 里刷不了自己挂在 `/` 的分区）：
+
+   ```sh
+   adb reboot bootloader
+   fastboot -s SERIAL -S 128M flash sunuefi_root root.sparse.img
+   fastboot reboot
+   ```
+
+3. 回到 Android 后，在引导助手里选 **UEFI + Linux** 启动。
 
 **顺序不能颠倒**：先换 ESP 再刷 root。反过来的话，中间那次重启是「旧内核 + 新 rootfs」
 （内核版本对不上，起不来），而「新内核 + 旧 rootfs」还可能进系统但硬件全丢。
 
+**换完 ESP、还没刷 root 的这段窗口里，Linux 起不来**（内核和 rootfs 对不上），但 Android
+照常可用，所以设备不会变砖——这也是为什么两件事要在同一次操作里连着做完。
+
 ## 6. 回退
 
-- ESP 有备份：fastboot 刷回 `esp-backup.img`，或从 `/boot/efi` 里另存的原文件拷回。
-- root：本机原系统会被覆盖，**这是不可逆的**，除非事先做过 root 分区镜像。
-  只想试内核的话，不要刷 root，改 cmdline 里的 `piano.root=` 指向别的分区即可
-  （cmdline 在固件里，做不到，所以实际不可行——这也是为什么这套方案属于「整机替换」）。
+- **ESP**：`sh port/tools/native/rollback-esp.sh /home/piano/esp-backup-<时间戳>`
+  （需要能进 Linux）。进不了 Linux 的话，只能从 Android 侧 fastboot 刷回完整 ESP 镜像——
+  而 `deploy-esp.sh` 只备份了四个文件，没有整块 `dd` 备份，所以**想留整块回退路径的
+  话，换 ESP 之前自己 `sudo dd if=/dev/sda35 of=esp-backup.img bs=1M` 存一份**。
+- **root**：上游镜像是 Android 稀疏镜像，`fastboot flash` 会覆盖整块分区，
+  本机原 Debian（26 GB 已用）**不可逆丢失**，除非事先做过分区镜像。
+- 只想试内核不换 rootfs：不可行。`piano.root=` 编译在固件里，改不了指向。
 
 ## 7. 与 port-stage-esp.py 的关系
 

@@ -32,6 +32,17 @@ for arg in $(cat /proc/cmdline); do
     new="$new $arg"
 done
 [ "$have_root" = 1 ] || new="$new root=$spec"
+
+# 上游自己的 boot.img cmdline 里有这两项，固件的不带，补齐以贴近他们已验证的组合：
+#   systemd.gpt_auto=0     —— 别让 systemd 按分区类型自动生成挂载单元，fstab 由我们自己管；
+#   msm.separate_gpu_kms=0 —— 上游内核显示路径依赖这个默认值，缺了可能只有黑屏。
+for extra in systemd.gpt_auto=0 msm.separate_gpu_kms=0; do
+    key=${extra%%=*}
+    case " $new " in
+        *" $key="*) ;;   # 按前缀判重，避免同名不同值时出现两份
+        *) new="$new $extra" ;;
+    esac
+done
 cmdline=${new# }
 
 # systemd-fstab-generator 只读 /proc/cmdline，用 bind mount 提供改写后的副本。
