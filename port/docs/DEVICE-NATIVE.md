@@ -99,7 +99,28 @@ shim 里**只用 shell 内建语法**，因为上游 initramfs 里：
 - 不保证有 `sed`——所以用 `for` 循环重建 cmdline，而不是 `sed 's/ ro / rw /'`；
 - `/bin`、`/sbin`、`/lib` 都是指向 `usr/*` 的符号链接，`#!/bin/sh` 可以解析（`dash` 在 `/usr/bin/dash`）。
 
-### 3.2 rootfs 首次启动修正单元
+### 3.2 上游 `/init` 在交接时会硬校验 DT
+
+`exec /init` 交出去的不是 systemd 本体，而是一层 shell 包装（761 B）：铺好 `/dev/console`、
+挂 `/proc` `/sys`、跑 `/usr/libexec/piano/piano-physical-platform /sys`，最后才
+`exec /usr/lib/systemd/systemd`。
+
+`piano-physical-platform` 在 `set -e` 下逐条断言 DT 属性：
+
+```
+compatible 必须逐行含 xiaomi,piano
+model      必须等于 "Xiaomi Pad 8 Pro"
+chassis-type 必须等于 tablet
+```
+
+任何一条不成立，脚本非零退出 → `/init` 因 `set -e` 退出 → **PID 1 死掉，直接 panic**。
+所以 `board.dtb` 必须用他们发布的那份（DT 属性就是被这个脚本当契约读的），
+换成本机 1.2 MB 的 DTB 前，先确认它的 `model` / `chassis-type` 也一致。
+
+同一层里还有两个 `piano.debug=1` 门控的单元（`piano-debug.service`、
+`piano-debug-timeout.service`），固件 cmdline 不带这个参数，所以不会启动，无需处理。
+
+### 3.3 rootfs 首次启动修正单元
 
 上游 rootfs 的 fstab 指向它自己的分区方案（`PARTLABEL=linux_rootfs` / `linux_data`），
 本机不存在这两块分区，systemd 会因挂载失败拖住 `local-fs.target`。
