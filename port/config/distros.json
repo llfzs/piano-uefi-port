@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "description": "发行版构建矩阵：上游 yzddmr6 只发布 Ubuntu 26.04 rootfs（按 tag 发 Release，CI 直接消费其成品并 UEFI 化）；保留扩展位以便将来接 SunUEFI 的多发行版。产物名严格对齐 SunUEFI build-products.yml 的 SunUEFI-Root-<target>。",
+  "default": "ubuntu-gnome",
+  "distros": [
+    {
+      "target": "ubuntu-gnome",
+      "artifact": "SunUEFI-Root-ubuntu-gnome",
+      "root_image": "root-ubuntu-gnome.sparse.img",
+      "source": "yzddmr6/xiaomipad-8pro-mainline 最新 Release 的 piano-ubuntu-<tag>-rootfs.img.zst.part* -> root.sparse.img（Android sparse，原样透传）",
+      "rootfs_builder": "upstream-release:tools/build-rootfs-image.py（上游本地构建并发布，CI 不重编）",
+      "desktop": "gnome",
+      "enabled": true,
+      "note": "唯一启用项：直接消费上游按 tag 发布的 Ubuntu 26.04 根系统；上游发新版自动跟随"
+    },
+    {
+      "target": "debian-gnome",
+      "artifact": "SunUEFI-Root-debian-gnome",
+      "root_image": "root-debian-gnome.sparse.img",
+      "source": "Project-SunUEFI / debian-piano-current",
+      "rootfs_builder": "sunuefi:tools/build_release_rootfs.py",
+      "desktop": "gnome",
+      "enabled": false,
+      "note": "扩展位：需以 git subtree 引入 SunUEFI 后启用，见 docs/PORTING-MAP.md"
+    },
+    {
+      "target": "debian-kde",
+      "artifact": "SunUEFI-Root-debian-kde",
+      "root_image": "root-debian-kde.sparse.img",
+      "source": "Project-SunUEFI / debian-piano-current",
+      "rootfs_builder": "sunuefi:tools/build_release_rootfs.py",
+      "desktop": "kde",
+      "enabled": false,
+      "note": "扩展位"
+    },
+    {
+      "target": "nyarch-gnome",
+      "artifact": "SunUEFI-Root-nyarch-gnome",
+      "root_image": "root-nyarch-gnome.sparse.img",
+      "source": "Project-SunUEFI / nyarch",
+      "rootfs_builder": "sunuefi:tools/build_nyarch_rootfs.py",
+      "desktop": "gnome",
+      "enabled": false,
+      "note": "扩展位"
+    },
+    {
+      "target": "steamos",
+      "artifact": "SunUEFI-Root-steamos",
+      "root_image": "root-steamos.sparse.img",
+      "source": "Project-SunUEFI / SteamOS-ARM-Port",
+      "rootfs_builder": "sunuefi:tools/build_steamos_rootfs.py",
+      "desktop": "gamescope",
+      "enabled": false,
+      "note": "扩展位"
+    }
+  ],
+  "shared_artifacts": ["SunUEFI-Module", "SunUEFI-ESP"],
+  "note": "Module 与 ESP 全发行版共用，只在矩阵首个 target 上传一次（对齐 SunUEFI 的 shared_target 机制）。"
+}

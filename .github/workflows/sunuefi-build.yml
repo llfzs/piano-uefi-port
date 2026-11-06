@@ -1,0 +1,442 @@
+name: SunUEFI build products
+
+# 需求 6：在 GitHub 上构建三产物 SunUEFI-Module / SunUEFI-ESP / SunUEFI-Root-<target>。
+# 需求 3 的核心：一直跟着 yzddmr6/xiaomipad-8pro-mainline 的更新。
+#   * 本仓库是独立的 port 层，不含上游源码副本，不做 git merge；
+#   * 上游不在 CI 编译（仓库无 workflow），成品按 tag 发 Release。因此默认构建路径
+#     source=upstream-release：自动拉上游最新 Release 的 boot.zip / rootfs 分卷 /
+#     tools.zip，校验 SHA256SUMS.assets，经 port/ 层 UEFI 化后产出**真镜像**；
+#   * 上游发新版 -> watch workflow 检测到并 dispatch 本构建，自动跟随，无需改 tag。
+# 需求 7：把三产物发布到 GitHub Release（publish job）：
+#   * push tag v*        -> 构建完成后自动发布到该 tag
+#   * workflow_dispatch  -> 勾 publish_release 手动发布（可不打 tag，自动生成 port-<sha>）
+#   * 另有 sunuefi-release.yml 用于「不重新编译、从已有 run 补发/重发」。
+# 发布门禁：占位骨架产物（只有 README.txt）强制降级为草稿+预发布，不冒充正式版。
+# 高级可选 source=kernel-source：从内核源码重新编译。本仓库不含 kernel/，选此路径
+#   必须先自备一份 yzddmr6 源码工作树（见 docs/RELEASE.md），否则会明确失败。
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'port/**'
+      - '.github/workflows/**'
+      - 'README.md'
+  repository_dispatch:
+    types: [upstream-synced, upstream-release]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '发行版 target（对应 SunUEFI-Root-<target>）'
+        type: choice
+        options: [all, ubuntu-gnome, debian-gnome, debian-kde, nyarch-gnome, steamos]
+        default: all
+      source:
+        description: '构建输入源：upstream-release=拉上游最新 Release 成品（默认，跟着上游更新）；kernel-source=从内核源码重编（等价于旧 full_build，需外部输入）；skeleton=只跑骨架自检'
+        type: choice
+        options: [upstream-release, kernel-source, skeleton]
+        default: upstream-release
+      upstream_tag:
+        description: '指定上游 Release tag（留空=自动取 yzddmr6 最新 latest，跟随上游更新）'
+        type: string
+        default: ''
+      skip_root:
+        description: '跳过 3.5GB rootfs 分卷下载（仅用于快速验证 ESP/Module 链路；root 产物会缺失，发布门禁将拦截）'
+        type: boolean
+        default: false
+      external_inputs_dir:
+        description: '外部输入目录（仅 kernel-source 路径使用），相对仓库根'
+        type: string
+        default: 'port/inputs'
+      publish_release:
+        description: '构建完成后把三产物发布到 GitHub Release（需求 7）'
+        type: boolean
+        default: false
+      release_tag:
+        description: '发布用 tag（留空且非 tag push 时自动生成 port-<短SHA>）'
+        type: string
+        default: ''
+      draft:
+        description: '发布为草稿（仅手动发布时生效）'
+        type: boolean
+        default: false
+      prerelease:
+        description: '标记为预发布（仅手动发布时生效）'
+        type: boolean
+        default: false
+      allow_placeholder_release:
+        description: '显式允许把占位骨架产物发布为正式版（默认 false：占位时强制草稿+预发布）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sunuefi-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 门禁：校验 port 层自包含（独立仓库，不混入上游源码、workflow 前缀不撞名）
+  isolation:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 校验 port 命名空间隔离
+        run: python3 port/tools/port-check-isolation.py --root . --mode tree --json
+      - name: 离线自检（桥接脚本 + payload 契约 + 账号 + 三产物 + Release 资产）
+        run: bash port/verify-port.sh .
+
+  select:
+    needs: isolation
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      shared: ${{ steps.m.outputs.shared }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        env:
+          TARGET: ${{ inputs.target || 'all' }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          cfg = json.load(open('port/config/distros.json'))
+          enabled = [d['target'] for d in cfg['distros'] if d['enabled']]
+          t = os.environ.get('TARGET', 'all')
+          chosen = enabled if t in ('', 'all') else [t]
+          print('matrix=' + json.dumps({'target': chosen}, separators=(',', ':')))
+          print('shared=' + (chosen[0] if chosen else ''))
+          PY
+
+  build:
+    needs: select
+    # 完整编译用 ARM64 runner（对齐 SunUEFI build-products.yml）；port 层任意 runner 均可
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    env:
+      SUNUEFI_TARGET: ${{ matrix.target }}
+      # 默认永远用上游最新 Release 成品（上游发新版自动跟随，不写死 tag）。
+      # 只有显式选 source=kernel-source 才走从源码重编的高级路径。
+      SOURCE: ${{ inputs.source || github.event.client_payload.source || 'upstream-release' }}
+      UPSTREAM_TAG: ${{ inputs.upstream_tag || github.event.client_payload.upstream_tag || '' }}
+      SKIP_ROOT: ${{ inputs.skip_root && '1' || '0' }}
+      FULL_BUILD: ${{ (inputs.source || github.event.client_payload.source || 'upstream-release') == 'kernel-source' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: false
+
+      - name: 释放 runner 磁盘（上游 rootfs 为 60GiB sparse）
+        if: env.SOURCE == 'upstream-release'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android 2>/dev/null || true
+          df -h .
+
+      - name: 安装构建依赖（zstd / mtools / unzip）
+        if: env.SOURCE != 'skeleton'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd mtools dosfstools lz4 unzip e2fsprogs
+
+      - name: 主机工具检查
+        run: |
+          python3 --version
+          bash port/verify-port.sh . >/dev/null && echo "port 层自检通过"
+
+      # ---- 默认路径：消费上游最新 Release 成品（由上游源码编译发布） ----
+      # 这是「主干用上游源码、一直跟着更新」的落地点：不重编内核，只把上游按 tag
+      # 发布的 boot.zip / rootfs 分卷 / tools.zip 拉下来，校验后做 UEFI 化后处理。
+      # 上游发新版 -> sync workflow dispatch -> 这里自动拉新 tag，无需改任何配置。
+      - name: '[上游 Release] 拉取 yzddmr6 最新成品 -> UEFI 三产物真镜像'
+        id: upstream
+        if: env.SOURCE == 'upstream-release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: yzddmr6/xiaomipad-8pro-mainline
+        run: |
+          set -euo pipefail
+          PORT_INPUTS="$RUNNER_TEMP/port-inputs"
+          mkdir -p "$PORT_INPUTS"
+          ARGS=(--fork "$PWD" --inputs "$PORT_INPUTS" --repo "$UPSTREAM_REPO")
+          if [ -n "$UPSTREAM_TAG" ]; then ARGS+=(--tag "$UPSTREAM_TAG"); fi
+          if [ "$SKIP_ROOT" = '1' ]; then ARGS+=(--skip-root); fi
+          bash port/build/port-from-upstream-release.sh "${ARGS[@]}"
+          # shellcheck disable=SC1090
+          source "$PORT_INPUTS/port-inputs.env"
+          echo "inputs=$INPUTS_DIR" >> "$GITHUB_OUTPUT"
+          echo "esp=${ESP_IMAGE:-}" >> "$GITHUB_OUTPUT"
+          echo "root=${ROOT_IMAGE:-}" >> "$GITHUB_OUTPUT"
+          echo "module=${MODULE_ZIP:-}" >> "$GITHUB_OUTPUT"
+          echo "status=${FULL_BUILD_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "tag=${UPSTREAM_TAG:-}" >> "$GITHUB_OUTPUT"
+          echo "::notice::上游 ${UPSTREAM_TAG:-latest} -> UEFI 化状态 ${FULL_BUILD_STATUS:-UNKNOWN}"
+          {
+            echo "### 上游 Release 构建（输入 = 上游源码编译发布的成品）"
+            echo "- 上游 tag: \`${UPSTREAM_TAG:-latest}\`（未写死，自动跟随上游最新）"
+            echo "- 上游仓库: \`$UPSTREAM_REPO\`"
+            echo "- 状态: \`${FULL_BUILD_STATUS:-UNKNOWN}\`"
+            echo "- 说明: 消费上游按 tag 发布的编译成品，经 port/ 层 UEFI 化；不重编内核"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传上游溯源清单
+        if: env.SOURCE == 'upstream-release' && steps.upstream.outputs.inputs != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-release-meta-${{ matrix.target }}
+          path: |
+            ${{ steps.upstream.outputs.inputs }}/upstream-release.json
+            ${{ steps.upstream.outputs.inputs }}/upstream-adapt.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ---- 高级可选（source=kernel-source）：从内核源码重新编译 ----
+      # 旧版唯一路径，需要 QEMU chroot / Ubuntu ISO / 原厂 DTB / 签名密钥等外部输入，
+      # 公共 runner 无法提供；保留给自建 runner。失败即 job 失败，不静默产占位。
+      # 本仓库为独立 port 层，不含 kernel/；选此路径需自备一份 yzddmr6 源码工作树，
+      # 用 --fork 指向它（见 port/docs/RELEASE.md 第 9 节）。
+      - name: '[FULL_BUILD] 上游真实编译接线（内核 + ESP 镜像）'
+        id: fullbuild
+        if: env.SOURCE == 'kernel-source'
+        env:
+          EXTERNAL_DIR: ${{ inputs.external_inputs_dir || 'port/inputs' }}
+        run: |
+          set -euo pipefail
+          # runner context 不允许用于 job 级 env，改用 runner 提供的 shell 环境变量
+          PORT_INPUTS="$RUNNER_TEMP/port-inputs"
+          mkdir -p "$PORT_INPUTS"
+          ARGS=(--fork "$PWD" --inputs "$PORT_INPUTS" --esp-size-mib 512)
+          if [ -n "$EXTERNAL_DIR" ]; then ARGS+=(--external-inputs "$PWD/$EXTERNAL_DIR"); fi
+          bash port/build/port-full-build.sh "${ARGS[@]}"
+          # 导出真实产物路径给「组装三产物」步骤
+          # shellcheck disable=SC1090
+          source "$PORT_INPUTS/port-inputs.env"
+          echo "inputs=$INPUTS_DIR" >> "$GITHUB_OUTPUT"
+          echo "esp=${ESP_IMAGE:-}" >> "$GITHUB_OUTPUT"
+          echo "root=${ROOT_IMAGE:-}" >> "$GITHUB_OUTPUT"
+          echo "module=${MODULE_ZIP:-}" >> "$GITHUB_OUTPUT"
+          echo "status=${FULL_BUILD_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "::notice::FULL_BUILD 状态: ${FULL_BUILD_STATUS:-UNKNOWN}（见 port-inputs-manifest.json）"
+
+      # ---- Stage A：port 层后处理 + 三产物打包 ----
+      # 两条来源（上游 Release / 源码编译）共用同一组 outputs，全部传真镜像参数。
+      # 去掉旧版的 "|| true"：打包失败则 job 失败，不再静默成功。
+      - name: 组装三产物（账号/挂载/ESP/打包）
+        env:
+          FB_INPUTS: ${{ steps.upstream.outputs.inputs || steps.fullbuild.outputs.inputs }}
+          FB_ESP: ${{ steps.upstream.outputs.esp || steps.fullbuild.outputs.esp }}
+          FB_ROOT: ${{ steps.upstream.outputs.root || steps.fullbuild.outputs.root }}
+          FB_MODULE: ${{ steps.upstream.outputs.module || steps.fullbuild.outputs.module }}
+          LEGACY_MODULE: ${{ inputs.source == 'kernel-source' && 'artifacts/android/SunUEFI-Piano.zip' || '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/downloads
+          PKG=(--fork "$PWD" --output "$PWD/artifacts/downloads/build" --target "$SUNUEFI_TARGET")
+          [ -n "$FB_INPUTS" ] && [ -d "$FB_INPUTS" ] && PKG+=(--inputs "$FB_INPUTS")
+          M="${FB_MODULE:-$LEGACY_MODULE}"
+          [ -n "$M" ] && [ -f "$M" ] && PKG+=(--module-zip "$M")
+          [ -n "$FB_ESP" ] && [ -f "$FB_ESP" ] && PKG+=(--esp-image "$FB_ESP")
+          [ -n "$FB_ROOT" ] && [ -f "$FB_ROOT" ] && PKG+=(--root-image "$FB_ROOT")
+          echo "port-build.sh 参数: ${PKG[*]}"
+          bash port/build/port-build.sh "${PKG[@]}" 2>&1 | tee build-port.log
+          test -f artifacts/downloads/build/manifest.json
+
+      # ---- 归置为三个 upload-artifact 目录（严格对齐 SunUEFI 命名）----
+      - name: 归置 SunUEFI-Module / -ESP / -Root 目录
+        run: |
+          set -euo pipefail
+          SRC=artifacts/downloads/build
+          mkdir -p out/module out/esp out/root
+          [ -d "$SRC/SunUEFI-Module" ] && cp -a "$SRC/SunUEFI-Module/." out/module/ || true
+          [ -d "$SRC/SunUEFI-ESP" ] && cp -a "$SRC/SunUEFI-ESP/." out/esp/ || true
+          ROOT_DIR=$(find "$SRC" -maxdepth 1 -type d -name "SunUEFI-Root-*" | head -1 || true)
+          [ -n "$ROOT_DIR" ] && cp -a "$ROOT_DIR/." out/root/ || true
+          echo "SunUEFI-Root-$SUNUEFI_TARGET:"; ls -la out/root
+
+      - name: '上传 SunUEFI-Module（共享）'
+        if: matrix.target == needs.select.outputs.shared
+        uses: actions/upload-artifact@v4
+        with:
+          name: SunUEFI-Module
+          path: out/module/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+
+      - name: '上传 SunUEFI-ESP（共享）'
+        if: matrix.target == needs.select.outputs.shared
+        uses: actions/upload-artifact@v4
+        with:
+          name: SunUEFI-ESP
+          path: out/esp/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 1
+
+      - name: '上传 SunUEFI-Root-<target>'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SunUEFI-Root-${{ matrix.target }}
+          path: out/root/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 1
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: port-build-log-${{ matrix.target }}
+          path: build-port.log
+          if-no-files-found: ignore
+
+  # ---- 需求 7：把本次构建的三产物推到 GitHub Release ----
+  # 只在 tag push 或手动勾选 publish_release 时运行；其余构建只上传 Actions artifacts。
+  publish:
+    needs: [select, build]
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success' &&
+          (startsWith(github.ref, 'refs/tags/v') ||
+           (github.event_name == 'workflow_dispatch' && inputs.publish_release)) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      WANT_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft && '1' || '0' }}
+      WANT_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 释放 runner 磁盘（root sparse 约 8GiB，分卷发布需额外空间）
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android 2>/dev/null || true
+          df -h .
+
+      - name: 下载本次构建的 SunUEFI-* 产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: SunUEFI-*
+          path: release-download
+          merge-multiple: false
+
+      - name: 下载上游溯源清单
+        uses: actions/download-artifact@v4
+        with:
+          pattern: upstream-release-meta-*
+          path: upstream-meta
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: 生成 Release 资产（ZIP + 全局 SHA256SUMS + manifest + 说明）
+        id: assets
+        env:
+          TAG_FROM_REF: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          TAG_FROM_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}
+        run: |
+          set -euo pipefail
+          TAG="${TAG_FROM_REF:-${TAG_FROM_INPUT:-port-$(git rev-parse --short HEAD)}}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # 把真实上游 Release tag 写进说明，供 sync workflow 去重检测
+          UP_TAG=$(python3 -c 'import json,glob; p=glob.glob("upstream-meta/**/upstream-release.json",recursive=True); print(json.load(open(p[0])).get("tag","") if p else "")' 2>/dev/null || true)
+          BASELINE="yzddmr6/xiaomipad-8pro-mainline@unknown"
+          if [ -n "$UP_TAG" ]; then
+            # 必须与 sunuefi-sync-upstream.yml 的去重 NEEDLE 同前缀
+            BASELINE="yzddmr6/xiaomipad-8pro-mainline@$UP_TAG (upstream-release)"
+          fi
+          echo "上游基线: $BASELINE"
+          python3 port/tools/port-release-assets.py \
+            --artifacts release-download \
+            --out release-assets \
+            --tag "$TAG" \
+            --policy port/config/release-policy.json \
+            --repo "$GH_REPO" \
+            --run-id "${{ github.run_id }}" \
+            --commit "${{ github.sha }}" \
+            --upstream-baseline "$BASELINE" \
+            --json | tee release-summary.json
+
+      - name: 应用发布门禁（占位骨架不得作为正式版）
+        id: guard
+        env:
+          ALLOW_PLACEHOLDER: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_placeholder_release || false }}
+        run: |
+          set -euo pipefail
+          DRAFT="$WANT_DRAFT"
+          PRE="$WANT_PRERELEASE"
+          GSTATUS="GUARD_DISABLED"
+          GMESSAGE=""
+          if [ -f release-assets/release-flags.env ]; then
+            # shellcheck disable=SC1091
+            source release-assets/release-flags.env
+            GSTATUS="${GUARD_STATUS:-GUARD_DISABLED}"
+            GMESSAGE="${GUARD_MESSAGE:-}"
+            if [ "${FORCE_DRAFT:-0}" = "1" ] && [ "$ALLOW_PLACEHOLDER" != "true" ]; then
+              DRAFT=1
+              PRE=1
+              echo "::warning::发布门禁：检测到占位骨架产物，强制草稿 + 预发布（不是可刷固件）"
+            elif [ "${FORCE_DRAFT:-0}" = "1" ]; then
+              echo "::warning::已显式勾选 allow_placeholder_release，跳过门禁降级"
+            fi
+          fi
+          echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "status=$GSTATUS" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 发布门禁"
+            echo "- 状态: \`$GSTATUS\`"
+            echo "- 最终草稿: \`$DRAFT\` / 预发布: \`$PRE\`"
+            if [ -n "$GMESSAGE" ]; then
+              echo "- 说明: $GMESSAGE"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 发布到 GitHub Release
+        env:
+          DRAFT: ${{ steps.guard.outputs.draft }}
+          PRE: ${{ steps.guard.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.assets.outputs.tag }}"
+          TITLE="SunUEFI for Xiaomi Pad 8 Pro - ${TAG}"
+          cd release-assets
+          mapfile -t FILES < upload-files.txt
+          echo "待上传 ${#FILES[@]} 个文件: ${FILES[*]}"
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "Release 已存在：更新说明并覆盖同名 asset"
+            gh release edit "$TAG" --repo "$GH_REPO" --notes-file RELEASE-NOTES.md
+            if [ "$DRAFT" = "1" ]; then
+              gh release edit "$TAG" --repo "$GH_REPO" --draft --prerelease
+            fi
+            gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GH_REPO"
+          else
+            ARGS=(create "$TAG" "${FILES[@]}" --repo "$GH_REPO" \
+                  --title "$TITLE" --notes-file RELEASE-NOTES.md)
+            [ "$DRAFT" = "1" ] && ARGS+=(--draft)
+            [ "$PRE" = "1" ] && ARGS+=(--prerelease)
+            gh release "${ARGS[@]}"
+          fi
+          gh release view "$TAG" --repo "$GH_REPO" --json url,tagName,isDraft,isPrerelease
+
+      - name: 汇总
+        env:
+          GUARD_STATUS: ${{ steps.guard.outputs.status }}
+          DRAFT: ${{ steps.guard.outputs.draft }}
+        run: |
+          TAG="${{ steps.assets.outputs.tag }}"
+          echo "### Release 发布结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 链接: https://github.com/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 触发: \`${{ github.event_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 发布门禁: \`$GUARD_STATUS\`（草稿=$DRAFT）" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 资产: SunUEFI-Module.zip / SunUEFI-ESP.zip / SunUEFI-Root-*.zip / manifest.json / SHA256SUMS / RELEASE-NOTES.md" >> "$GITHUB_STEP_SUMMARY"

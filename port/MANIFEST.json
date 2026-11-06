@@ -1,0 +1,23 @@
+{
+  "schema": 6,
+  "repository": "llfzs/piano-uefi-port",
+  "mode": "standalone-port-repository",
+  "description": "独立的 UEFI 移植层仓库：消费 yzddmr6/xiaomipad-8pro-mainline 最新 Release 成品，产出可刷入的 SunUEFI 三产物镜像包",
+  "upstream_source": "yzddmr6/xiaomipad-8pro-mainline（源码由上游维护，本仓库不含其副本，不做 git merge）",
+  "upstream_artifacts": "上游最新 Release 成品（由上游源码本地编译发布；CI 动态取 releases/latest，不写死 tag）",
+  "sunuefi_source": "llfzs/Project-SunUEFI（UEFI 契约/工具参考，非构建输入源）",
+  "layout": "flat：.github/workflows/ 与 port/ 直接在仓库根，无需 apply-port.sh",
+  "requirements": {
+    "1_uefi_dual_boot": "port/tools/port-stage-esp.py + port-switch.sh",
+    "2_partitions": "sunuefi_esp/sunuefi_root (config/port-profile.json)",
+    "3_upstream_tracking": "sunuefi-sync-upstream.yml 检测上游最新 Release 并派发重建（独立仓库，不合并上游源码）",
+    "4_three_artifacts": "port/tools/port-package-artifacts.py (SunUEFI-Module/-ESP/-Root-<target>)",
+    "5_login": "piano/piano + root piano (port-inject-login.py，打进 Module ZIP 首次启动注入)",
+    "6_github_actions": ".github/workflows/sunuefi-build.yml",
+    "7_release": "sunuefi-build.yml#publish + sunuefi-release.yml + port/tools/port-release-assets.py",
+    "8_upstream_release_build": "port/build/port-from-upstream-release.sh + port/tools/port-upstream-release.py（默认路径）",
+    "9_full_build_optional": "port/build/port-full-build.sh（高级可选：需自备上游源码工作树）",
+    "10_release_guard": "config/release-policy.json#placeholder_guard + release-flags.env"
+  },
+  "status": "PORT_READY_BUILT_NOT_FLASHED"
+}

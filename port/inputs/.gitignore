@@ -1,0 +1,4 @@
+# 外部输入（initramfs.cpio.gz / root.ext4 / SunUEFI-Piano-*.zip / 原厂 DTB）
+# 体积大且可能含设备标识，不提交进 git；用 LFS / Release asset / 自建 runner 预置。
+*
+!.gitignore

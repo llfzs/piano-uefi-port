@@ -1,0 +1,10 @@
+# SunUEFI 引导层引用清单（参考，非本仓库构建输入）
+# 本仓库只消费 yzddmr6 上游 Release 成品做 UEFI 化，不复制 SunUEFI 源码。
+# 若将来需要 UEFI FD / Android 助手模块源码，按固定 commit 引入：
+#   git subtree add --prefix=sunuefi https://github.com/llfzs/Project-SunUEFI main --squash
+uefi/core uefi/components uefi/handoff uefi/platforms
+android/module android/native
+tools/build_android_product_module.py tools/build_boot_request.py
+tools/build_boot_repack.py tools/package_sparse_images.py
+tools/package_kernel_payload.py tools/install_piano.py
+vendor/piano vendor/piano-linux

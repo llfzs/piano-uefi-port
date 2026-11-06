@@ -7,3 +7,7 @@ __pycache__/
 *.sparse.img
 *.raw
 port.bak.*/
+
+# 本机/设备专属输入（大镜像、原厂 DTB），不提交进 git
+port/inputs/*
+!port/inputs/.gitignore

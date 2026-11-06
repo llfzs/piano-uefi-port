@@ -1,0 +1,13 @@
+上游跟随配置（独立仓库，无需 git remote / merge）
+================================================
+1) 上游源码由 yzddmr6/xiaomipad-8pro-mainline 维护；他按 tag 发布编译好的成品 Release。
+2) 本仓库 sunuefi-build.yml 默认 source=upstream-release，动态取 releases/latest，
+   下载并校验 SHA256SUMS.assets 后做 UEFI 化。上游发新版自动跟随，无需改任何配置。
+3) sunuefi-sync-upstream.yml 定时检测上游最新 Release，发现新 tag 自动派发重建；
+   也可手动 workflow_dispatch 并指定 upstream_tag。
+4) 不需要配置 upstream remote，不需要 SYNC_TOKEN（除非要自动打发布 tag）。
+
+发布 Release（见 port/docs/RELEASE.md）：
+  git tag -a v0.10.0-port1 -m "SunUEFI port1" && git push origin v0.10.0-port1
+  # 或 Actions -> SunUEFI build products -> 勾 publish_release
+  # 或 Actions -> SunUEFI publish release -> 填 tag 从已有 run 补发（不重编译）

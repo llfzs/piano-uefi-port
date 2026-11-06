@@ -1,0 +1,55 @@
+{
+  "schema": 2,
+  "description": "需求 7：把 sunuefi-build.yml 构建出的三产物发布到 GitHub Release 的策略。独立 port 仓库，发布脚本/配置/workflow 全部为自有内容。schema 2 新增 placeholder_guard 发布门禁。",
+  "tag_prefix": "v",
+  "tag_trigger_glob": "v*",
+  "auto_tag_template": "port-{short_sha}",
+  "release_name_template": "SunUEFI for Xiaomi Pad 8 Pro - {tag}",
+  "draft": false,
+  "prerelease": false,
+  "clobber": true,
+  "clobber_note": "同一 tag 重跑时覆盖同名 asset，避免 CI 重跑失败；release 已存在则走 gh release upload。",
+  "placeholder_guard": {
+    "enabled": true,
+    "on_placeholder": "draft_prerelease",
+    "allow_override_input": "allow_placeholder_release",
+    "flags_file": "release-flags.env",
+    "message": "检测到占位产物（目录里只有 README.txt，不是可刷镜像）。本次发布强制降级为草稿 + 预发布；默认 source=upstream-release 会拉上游最新 Release 成品产出真镜像，无需手动编译；如需正式发布请确认三产物均为 READY，或在手动发布时显式勾选 allow_placeholder_release。",
+    "note": "门禁由 port-release-assets.py 在生成资产时判定，输出 release-flags.env；两个 publish job source 该文件后覆盖 --draft/--prerelease。flags 文件只是 CI 中间产物，不进 upload-files.txt 与 SHA256SUMS。"
+  },
+  "upload_files": [
+    "SunUEFI-Module.zip",
+    "SunUEFI-ESP.zip",
+    "SunUEFI-Root-*.zip",
+    "manifest.json",
+    "SHA256SUMS",
+    "RELEASE-NOTES.md"
+  ],
+  "required_artifacts": [
+    "SunUEFI-Module",
+    "SunUEFI-ESP",
+    "SunUEFI-Root-"
+  ],
+  "required_note": "严格校验：发布前必须同时存在 Module、ESP 与至少一个 SunUEFI-Root-<target>；缺一即失败（--allow-partial 仅供离线自检）。",
+  "notes": {
+    "include_checksums": true,
+    "include_upstream_baseline": true,
+    "include_placeholder_warning": true,
+    "safety_reminder": [
+      "刷机有变砖风险：首次先 fastboot boot 内存试运行，备份原厂 BOOT 并确认可还原。",
+      "不刷 vbmeta/dtbo、不碰 B 槽、不格式化 userdata；电量 >= 40%。",
+      "占位产物（README.txt）不是可刷镜像；默认构建直接消费上游 yzddmr6 最新 Release 成品并 UEFI 化，产出真实镜像后才会 GUARD_CLEAR。",
+      "下载后先执行 sha256sum -c SHA256SUMS 校验完整性。"
+    ]
+  },
+  "upstream_config": "port/config/upstream-sync.json",
+  "namespaces": [
+    "port/",
+    ".github/workflows/sunuefi-*"
+  ],
+  "workflows": {
+    "build_and_publish": ".github/workflows/sunuefi-build.yml",
+    "manual_republish": ".github/workflows/sunuefi-release.yml",
+    "sync": ".github/workflows/sunuefi-sync-upstream.yml"
+  }
+}

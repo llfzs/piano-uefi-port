@@ -1,0 +1,132 @@
+name: SunUEFI watch upstream releases
+
+# 独立 port 仓库：本仓库不含 yzddmr6 的源码副本，不需要也不应该做 git merge。
+# 「跟随上游」= 监视 yzddmr6/xiaomipad-8pro-mainline 的最新 Release（由上游源码
+# 编译发布的成品），发现新 tag 就派发重建，让 sunuefi-build.yml 拉新成品重新 UEFI 化。
+#
+# 触发链路：
+#   schedule / 手动 -> 查上游 releases/latest -> 与本仓库已发布 Release 比对去重
+#   -> POST repository_dispatch(event_type=upstream-release) -> sunuefi-build.yml
+#   -> source=upstream-release 拉新 tag 成品 -> 三产物真镜像 -> (可选) 发布 Release
+#
+# 注意：repository_dispatch 是 GITHUB_TOKEN 允许触发新 workflow run 的例外事件，
+# 因此本 workflow 用内置 github.token 即可，不强制要求 SYNC_TOKEN。
+# SYNC_TOKEN（repo PAT）只在「自动打 v* tag 触发发版」时可选需要。
+on:
+  schedule:
+    - cron: '0 18 * * 2'   # 每周二 02:00 (UTC+8)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只检查上游版本与去重结果，不派发重建'
+        type: boolean
+        default: false
+      upstream_tag:
+        description: '指定上游 Release tag（留空=自动取 yzddmr6 最新 latest）'
+        type: string
+        default: ''
+      force_rebuild:
+        description: '忽略去重，强制派发一次重建'
+        type: boolean
+        default: false
+      release_tag_after_sync:
+        description: '[可选] 派发时同时打此 v* tag 触发自动发版（需 SYNC_TOKEN）'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: sunuefi-upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    env:
+      HAS_PAT: ${{ secrets.SYNC_TOKEN != '' && 'true' || 'false' }}
+      REPO: ${{ github.repository }}
+      UPSTREAM_REPO: yzddmr6/xiaomipad-8pro-mainline
+      WANT_TAG: ${{ inputs.upstream_tag || '' }}
+      DRY: ${{ inputs.dry_run && '1' || '0' }}
+      FORCE: ${{ inputs.force_rebuild && '1' || '0' }}
+      RELEASE_TAG: ${{ inputs.release_tag_after_sync || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 检测上游最新 Release 并派发重建
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "$WANT_TAG" ]; then
+            TAG="$WANT_TAG"
+          else
+            TAG=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq '.tag_name')
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::无法取得上游 Release tag"; exit 1
+          fi
+          echo "上游 Release tag = $TAG"
+
+          # 去重：本仓库已发布过的上游 tag 会写在 Release 说明里
+          NEEDLE="$UPSTREAM_REPO@$TAG"
+          ALREADY=$(gh api "repos/$REPO/releases?per_page=30" \
+                    --jq "[.[] | select((.body // \"\") | contains(\"$NEEDLE\"))] | length" 2>/dev/null || echo 0)
+          NEED_REBUILD=0
+          if [ "$ALREADY" != "0" ]; then
+            echo "本仓库已有对应 $TAG 的 Release"
+          else
+            echo "本仓库尚无对应 $TAG 的构建，需要重建"
+            NEED_REBUILD=1
+          fi
+          if [ "$FORCE" = '1' ]; then
+            echo "force_rebuild=1 -> 忽略去重强制重建"
+            NEED_REBUILD=1
+          fi
+
+          {
+            echo "### 上游 Release 监视"
+            echo "- 上游仓库: \`$UPSTREAM_REPO\`"
+            echo "- 上游 tag: \`$TAG\`"
+            echo "- 已发布过: $ALREADY"
+            echo "- 需要重建: $NEED_REBUILD"
+            echo "- 本仓库: 独立 port 层，不合并上游源码"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$NEED_REBUILD" = '0' ] || [ "$DRY" = '1' ]; then
+            echo "NEED_REBUILD=$NEED_REBUILD DRY=$DRY -> 跳过派发"
+            exit 0
+          fi
+
+          # 用内置 token 派发；repository_dispatch 允许触发新 run
+          curl -sSf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$REPO/dispatches" \
+            -d "{\"event_type\":\"upstream-release\",\"client_payload\":{\"upstream_tag\":\"$TAG\",\"source\":\"upstream-release\"}}"
+          echo "已派发 upstream-release 事件（tag=$TAG）"
+
+      - name: '[可选] 打发布 tag 触发自动发版'
+        if: >-
+          ${{ github.event_name == 'workflow_dispatch' &&
+              inputs.dry_run != true &&
+              inputs.release_tag_after_sync != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_PAT" != 'true' ]; then
+            echo "::error::用 GITHUB_TOKEN 打的 tag 不会触发 build workflow；请在 Secrets 配置 SYNC_TOKEN（repo PAT）"
+            exit 1
+          fi
+          git config user.name "sunuefi-sync[bot]"
+          git config user.email "sunuefi-sync[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" -m "SunUEFI release $RELEASE_TAG (upstream $WANT_TAG)"
+          git push origin "$RELEASE_TAG"
+          echo "已推送 $RELEASE_TAG -> 触发 sunuefi-build.yml 构建并自动发布 Release"

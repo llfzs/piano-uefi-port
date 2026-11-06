@@ -1,0 +1,14 @@
+UEFI 移植接线点 —— 独立 port 仓库
+=================================
+本仓库不含上游源码副本，全部输入来自 yzddmr6 最新 Release 成品：
+
+  1) 内核/ESP：port-from-upstream-release.sh 拉 boot.zip，解 Android Boot Image
+     抽裸 Image / initramfs / 合并 DTB，port-stage-esp.py 生成 SUNUEFI-LINUXv2 payload。
+  2) root：上游 rootfs 分卷拼接 zstd 解压得 root.sparse.img，原样透传。
+  3) 账号/挂载：port-inject-login.py + port-adapt-rootfs.py 的配置打进真实 Module ZIP，
+     由 service.sh 在 Android 侧首次启动时注入 sunuefi_root。
+  4) 切换/分区：port-switch.sh + Module 内 partition-plan.json
+     （新建 sunuefi_esp/sunuefi_root，不动 userdata）。
+  5) 发布：port-release-assets.py 对 >1.9GB 镜像自动分卷，发布门禁拦截占位骨架。
+
+真机仍需闭环 PORTING-MAP.md 的三个契约缺口（G1 挂载 / G2 EFI Stub / G3 合体 BOOT 头）。

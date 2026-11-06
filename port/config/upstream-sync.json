@@ -1,0 +1,56 @@
+{
+  "schema": 2,
+  "description": "上游跟随策略（独立 port 仓库）：本仓库不含 yzddmr6/xiaomipad-8pro-mainline 的源码副本，不做 git merge；只监视上游按 tag 发布的编译成品，发现新 Release 自动派发重建。",
+  "model": "standalone-port-repo",
+  "upstream": {
+    "name": "yzddmr6/xiaomipad-8pro-mainline",
+    "url": "https://github.com/yzddmr6/xiaomipad-8pro-mainline.git",
+    "branch": "main",
+    "track": "只读监视 releases/latest；源码由上游维护，本仓库不 clone、不 merge、不 push"
+  },
+  "principle": "本仓库是独立的 UEFI 移植层：.github/workflows/ 与 port/ 直接在仓库根，全部文件都是自有内容。上游源码活水通过「消费上游最新 Release 成品」实现——成品由上游源码本地编译后按 tag 发布，CI 动态取 latest 并校验 SHA256SUMS.assets，上游发新版自动跟随，无需改任何配置、无需同步 commit。",
+  "port_owned_namespaces": [
+    "port/",
+    ".github/workflows/sunuefi-"
+  ],
+  "upstream_source_dirs_absent": [
+    "apps/", "device/", "docs/", "firmware/", "initramfs/", "kernel/",
+    "mesa/", "packaging/", "ubuntu/", "tools/"
+  ],
+  "isolation_rules": {
+    "model": "port-self-contained",
+    "forbid_upstream_source_dirs": true,
+    "workflow_prefix": "sunuefi-",
+    "protected_port_files": [
+      "port/config/port-profile.json",
+      "port/config/distros.json",
+      "port/config/upstream-sync.json",
+      "port/tools/port-stage-esp.py",
+      "port/tools/port-adapt-rootfs.py",
+      "port/tools/port-partition-plan.py",
+      "port/tools/port-inject-login.py",
+      "port/tools/port-package-artifacts.py",
+      "port/tools/port-sync-upstream.sh",
+      "port/tools/port-check-isolation.py",
+      "port/tools/port-switch.sh",
+      "port/tools/port-release-assets.py",
+      "port/tools/port-upstream-release.py",
+      "port/config/release-policy.json",
+      "port/build/port-build.sh",
+      "port/build/port-full-build.sh",
+      "port/build/port-from-upstream-release.sh"
+    ]
+  },
+  "sync_steps": [
+    "sunuefi-sync-upstream.yml 定时/手动查上游 releases/latest（不写死 tag）",
+    "与本仓库已发布 Release 说明里的 <上游仓库>@<tag> 比对去重",
+    "发现新 tag -> POST repository_dispatch(event_type=upstream-release) 派发重建",
+    "sunuefi-build.yml 默认 source=upstream-release：port/build/port-from-upstream-release.sh 下载 boot.zip / rootfs 分卷 / tools.zip 并校验 SHA256SUMS.assets",
+    "port/tools/port-upstream-release.py 解 Android Boot Image -> Image/initramfs/DTB -> SUNUEFI-LINUXv2 ESP",
+    "root.sparse.img 原样透传；账号与挂载契约打进真实 Module ZIP",
+    "port-package-artifacts.py 产出三产物；port-release-assets.py 对大镜像自动分卷",
+    "发布门禁：占位产物强制草稿+预发布；真镜像 GUARD_CLEAR 正常发布",
+    "高级可选 source=kernel-source：需自备上游源码工作树（--upstream-src），本仓库不含 kernel/"
+  ],
+  "conflict_policy": "独立仓库不含上游源码，因此不存在 merge 冲突。若上游某天改了 Release 资产命名/压缩格式，port-from-upstream-release.sh 的下载校验会明确失败并报告，需人工适配 role_of()/解压流程；绝不静默产出占位。"
+}

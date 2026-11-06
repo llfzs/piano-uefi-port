@@ -1,118 +1,147 @@
-# xiaomipad-uefi-port —— 把 SunUEFI 引导移植进 xiaomipad-8pro-mainline
+# piano-uefi-port —— 用上游成品构建 SunUEFI 三产物镜像包
 
-在你 fork 的 [`yzddmr6/xiaomipad-8pro-mainline`](https://github.com/yzddmr6/xiaomipad-8pro-mainline)
-上，**用 UEFI 引导双系统**、走 SunUEFI 的分区与切换，同时**随时同步上游勤快维护的内核/硬件适配
-且永不冲突**，并在 GitHub Actions 上构建出三个标准产物包。
+独立的 UEFI 移植层仓库：消费 [`yzddmr6/xiaomipad-8pro-mainline`](https://github.com/yzddmr6/xiaomipad-8pro-mainline)
+**最新 Release 里由他源码编译发布的成品**，在 GitHub Actions 上做 UEFI 化，产出可刷入的
+`SunUEFI-Module` / `SunUEFI-ESP` / `SunUEFI-Root-<发行版>` 三产物，并发布到 GitHub Release。
 
-这是一套**可离线验证的移植层与 CI 骨架**，不是可直接刷入的成品固件。
+> **这个仓库不含上游源码副本，也不做 `git merge upstream/main`。**
+> 上游源码由 yzddmr6 自己维护、勤快更新；他本地编译后按 tag 发 Release，
+> 本仓库的 CI 动态取 `releases/latest`，校验 `SHA256SUMS.assets` 后 UEFI 化。
+> 他一发新版，监视 workflow 自动派发重建 —— 这就是「一直跟着上游更新」的落地方式。
 
-## 7 项需求如何落地（逐条）
+## 一句话架构
+
+```
+上游 yzddmr6 源码（他维护，本地编译，按 tag 发 Release）
+        │  CI 动态取 releases/latest，不写死 tag
+        ▼
+上游 Release 成品：boot.zip / rootfs.img.zst.part* / tools.zip / SHA256SUMS.assets
+        │  下载 + 逐个校验 sha256
+        ▼
+本仓库 port/ 层（只做后处理，不改上游任何东西）
+        ├─ ESP   : 解 Android Boot Image -> Image/initramfs/DTB -> SUNUEFI-LINUXv2 -> FAT32 -> sparse
+        ├─ Root  : root.sparse.img 原样透传（已是 Android sparse，可直接 fastboot flash）
+        └─ Module: 真实 ZIP（piano/piano 账号 + sunuefi_root 挂载契约 + 分区计划 + 切换）
+        ▼
+GitHub Release：三产物 + manifest.json + 全局 SHA256SUMS + RELEASE-NOTES.md
+```
+
+## 7 项需求如何落地
 
 | # | 需求 | 落在哪 |
 |---|---|---|
-| 1 | UEFI 引导双系统 | `port/tools/port-stage-esp.py`（`SUNUEFI-LINUXv2` ESP）+ `port-switch.sh`（BootRequest 切换）|
+| 1 | UEFI 引导双系统 | `port/tools/port-stage-esp.py`（`SUNUEFI-LINUXv2` ESP）+ `port-switch.sh`（BootRequest 切换） |
 | 2 | 保留 `sunuefi_esp` / `sunuefi_root` | `port/config/port-profile.json` + `port-adapt-rootfs.py` + `port-partition-plan.py`，**不动 userdata** |
-| 3 | 随时同步上游、不冲突 | **patchless 只增不改**：UEFI 全在 `port/` 与 `.github/workflows/sunuefi-*`；`port-sync-upstream.sh` + `port-check-isolation.py` 把"不相交"变成 CI 门禁 |
-| 4 | 三产物包 | `port-package-artifacts.py` → `SunUEFI-Module` / `SunUEFI-ESP` / `SunUEFI-Root-<target>`（Android sparse + manifest + SHA256SUMS）|
-| 5 | 账号/密码 `piano`/`piano`、root=`piano` | `port-inject-login.py` 注入 sha512-crypt 哈希 + GDM 自动登录 + sudoers |
-| 6 | GitHub Actions 构建 | `.github/workflows/sunuefi-build.yml`（三产物）+ `sunuefi-sync-upstream.yml`（定时同步）|
-| 7 | **构建产物推到 Release** | `sunuefi-build.yml` 的 `publish` job（push `v*` tag / 手动勾 `publish_release`）+ `sunuefi-release.yml`（从已有 run 补发）+ `port-release-assets.py`（三产物→同名 ZIP + 全局 SHA256SUMS + manifest + RELEASE-NOTES）|
+| 3 | 跟着上游更新、不冲突 | **独立仓库，无源码重叠**：`sunuefi-sync-upstream.yml` 监视上游 `releases/latest`，发现新 tag 派发 `upstream-release` 事件 |
+| 4 | 三产物包 | `port-package-artifacts.py` → 三个标准命名产物（Android sparse + manifest + SHA256SUMS） |
+| 5 | 账号/密码 `piano`/`piano`、root=`piano` | `port-inject-login.py` 生成的配置打进 Module ZIP，首次启动注入 |
+| 6 | GitHub Actions 构建 | `.github/workflows/sunuefi-build.yml`（默认 `source=upstream-release`） |
+| 7 | 构建产物推到 Release | `sunuefi-build.yml#publish` + `sunuefi-release.yml`（补发）+ `port-release-assets.py`（大镜像自动分卷）+ 发布门禁 |
 
-完整追踪矩阵见 `overlay/port/docs/REQUIREMENTS.md`，同步机制见 `overlay/port/docs/SYNC-UPSTREAM.md`，
-发布操作见 `overlay/port/docs/RELEASE.md`。
+完整追踪矩阵见 `port/docs/REQUIREMENTS.md`，上游跟随机制见 `port/docs/UPSTREAM-RELEASE.md`，
+发布操作见 `port/docs/RELEASE.md`，真机刷写边界见 `port/docs/PORTING-MAP.md` 第 6 节。
 
-## 最关键的架构决定：从"改上游"升级为"零上游修改"
-
-上一版工程包留了 5 个"人工接线点"要求改上游文件（内核 config、root-image.json、
-停用 piano-switch、改 INSTALL.md）——**那些正是每次同步上游必然冲突的地方**。本版全部撤销：
-
-- 上游 665 个文件里没有 `port/`，`.github/` 里也没有任何 workflow（只有 issue/PR 模板）；
-- 因此本 fork 的自有内容只放 `port/` 和带 `sunuefi-` 前缀的 workflow →
-  `git merge upstream/main` 三方合并天然不碰它们；
-- 所有"适配"改为**对上游构建产物做后处理**（Image/dtb/initrd→ESP、rootfs→注入账号+改挂载、
-  产物→三包），不写回上游一行源码；
-- `port-check-isolation.py` 在每次构建/同步时证明"改动集零上游重叠"。
-
-## 目录
+## 目录结构（扁平，直接就是最终仓库）
 
 ```
-xiaomipad-uefi-port/
+piano-uefi-port/
+├── .github/workflows/
+│   ├── sunuefi-build.yml           # 主构建 + 发布（默认 source=upstream-release）
+│   ├── sunuefi-release.yml         # 从已有 run 补发 Release，不重编译
+│   └── sunuefi-sync-upstream.yml   # 监视上游最新 Release 并派发重建
+├── port/
+│   ├── MANIFEST.json               # 架构与需求追踪
+│   ├── verify-port.sh              # 离线全量自检（结构/语法/契约/发布门禁）
+│   ├── build/                      # 构建编排
+│   │   ├── port-from-upstream-release.sh   # 默认：拉上游成品 -> UEFI 三产物真镜像
+│   │   ├── port-build.sh                   # 三产物组装总入口
+│   │   └── port-full-build.sh              # 高级：从源码重编（需自备上游源码）
+│   ├── config/                     # 分区/发行版/发布策略/上游跟随
+│   ├── tools/                      # UEFI 化、账号、分区、打包、门禁、校验
+│   ├── tests/                      # 离线自检 + 上游 Release fixture 生成器
+│   ├── docs/                       # 全部文档
+│   └── inputs/                     # 外部输入（.gitignore 忽略大镜像）
 ├── README.md
-├── apply-port.sh         应用到 fork（含 .github/workflows）
-├── verify-port.sh        离线校验（结构/语法/YAML/配置/自检/隔离）
-├── tests/selftest.py     合成输入真实跑通全部桥接脚本
-└── overlay/              ← 复制进 fork 的内容
-    ├── .github/workflows/
-    │   ├── sunuefi-build.yml          三产物构建 + publish job 发 Release
-    │   ├── sunuefi-release.yml        手动补发/重发（不重新编译）
-    │   └── sunuefi-sync-upstream.yml  上游定时同步（可选同步后打发布 tag）
-    └── port/                         ← 自包含移植层
-        ├── config/  port-profile.json · distros.json · upstream-sync.json
-        │            release-policy.json（需求 7）
-        ├── tools/   stage-esp · adapt-rootfs · inject-login · partition-plan
-        │            package-artifacts · check-isolation · sync-upstream · switch
-        │            release-assets（需求 7：三产物 → Release 资产）
-        ├── build/   port-build.sh     CI/本地构建编排总入口
-        ├── docs/    PORTING-MAP · REQUIREMENTS · SYNC-UPSTREAM · RELEASE ·（apply 生成清单）
-        └── tests/   （apply 时复制 selftest.py 进来，保持自包含）
+└── .gitignore
 ```
+
+没有 `overlay/`、没有 `apply-port.sh` —— workflows 和 `port/` 直接在仓库根，clone 下来即可用。
 
 ## 快速开始
 
+### 在 GitHub 上构建并发布正式版
+
 ```bash
-# 1) 离线自检（不需真机/编译/网络）
-./verify-port.sh
-
-# 2) 应用到你 fork 的 mainline 工作树
-./apply-port.sh ~/work/xiaomipad-8pro-mainline ~/work/Project-SunUEFI
-
-# 3) 复检落地 + 隔离校验
-./verify-port.sh ~/work/xiaomipad-8pro-mainline
-
-# 4) 配置上游同步（一次性）+ 查更新
-cd ~/work/xiaomipad-8pro-mainline
-bash port/tools/port-sync-upstream.sh . --init
-bash port/tools/port-sync-upstream.sh . --check
-
-# 5) 提交、push 到 GitHub → sunuefi-build.yml 自动产出三产物
-git add port/ .github/workflows/sunuefi-*.yml && git commit -m "port: SunUEFI UEFI boot layer"
-git push origin main
-
-# 6) 发 Release（需求 7）：tag push 会先构建、再由 publish job 自动发布
+# 方式 1：打 tag（自动触发构建 + 发布）
 git tag -a v0.10.0-port1 -m "SunUEFI port1" && git push origin v0.10.0-port1
-#    其他方式：Actions → SunUEFI build products → 勾 publish_release；
-#              或 → SunUEFI publish release → 填 tag（从已有 run 补发，不重编译）
+
+# 方式 2：Actions 手动跑
+# Actions -> SunUEFI build products -> Run workflow
+#   source=upstream-release（默认）
+#   publish_release=true ✅
+#   release_tag=v0.10.0-port1
+#   draft=false / prerelease=false / allow_placeholder_release=false
+
+# 方式 3：命令行
+gh workflow run sunuefi-build.yml --ref main \
+  -f source=upstream-release -f upstream_tag= \
+  -f publish_release=true -f release_tag=v0.10.0-port2 \
+  -f draft=false -f prerelease=false -f skip_root=false
 ```
 
-GitHub 上：Actions → `SunUEFI build products` 下载 `SunUEFI-Module`、`SunUEFI-ESP`、
-`SunUEFI-Root-ubuntu-gnome`；打 `v*` tag（或勾 `publish_release`）后，
-**Releases 页面**自动出现 `SunUEFI-Module.zip` / `SunUEFI-ESP.zip` /
-`SunUEFI-Root-*.zip` + `manifest.json` + `SHA256SUMS` + `RELEASE-NOTES.md`。
-`SunUEFI sync upstream` 每周定时把上游更新合进来并触发重建（想要"同步完立刻重建
-并自动发版"，在 Secrets 配 `SYNC_TOKEN` 并填 `release_tag_after_sync`）。
-发布权限、补发流程与排错见 `overlay/port/docs/RELEASE.md`。
+判定是不是**真正式版**（三者同时成立）：`manifest.json` 的
+`status=RELEASE_ASSETS_READY`；Release 页面 draft/预发布均为否；资产里有
+`esp.sparse.img`、`root-*.sparse.img.part*`、`SunUEFI-Piano-*.zip` 而不是 `README.txt`。
+`skip_root=true` 会被发布门禁拦下。
 
-## 三个必须自己闭环的缺口（详见 PORTING-MAP 第 2 节）
+### 本地离线自检（不联网、不下载 GB 级资产）
 
-- **G1 挂载契约**：源仓库 initramfs 认 `root=`、SunUEFI 认 `piano.root=`；cmdline 已带双参数，
-  真机前确认能挂上 `sunuefi_root`。
-- **G2 内核配置**：`CONFIG_EFI_STUB=y` 作为构建期只读校验项；确需开启在你自己的内核分支加。
-- **G3 合体 BOOT（最关键）**：SunUEFI 合体 BOOT 只认 Boot v4 / raw GKI / 96MiB；
-  你的 OS4.0.5 / Android 17 的 BOOT 头须先 `piano-boot-repack probe` 只读探测，兼容才能写入。
-  这也是"解开版本锁"能否成立的前提。
+```bash
+bash port/verify-port.sh              # 结构 + 语法 + YAML + 全链路自检
+python3 port/tests/selftest.py .      # 合成输入跑通 ESP/账号/三产物/发布门禁
 
-## 诚实边界
+# 上游 Release 适配器离线端到端（小型 fixture）
+python3 port/tests/make_upstream_fixture.py /tmp/fixture
+bash port/build/port-from-upstream-release.sh \
+    --fork . --inputs /tmp/fixture-inputs --fixture /tmp/fixture
+```
 
-**在 GitHub Actions 上一定能跑绿**：隔离校验、离线自检、三产物骨架打包（含占位说明）、
-artifact 上传、以及需求 7 的 Release 发布（`publish` job 用 `gh release create/upload`，
-占位产物会在 `RELEASE-NOTES.md` 里明确标注"不可刷机"）。
-**完整内核/rootfs 编译**（`FULL_BUILD=true`）依赖上游内核源码子模块、Ubuntu apt
-快照、专用 `mke2fs` 与**必须取自你本机的设备专属固件**，首次建议在 `ubuntu-24.04-arm` 或自建
-ARM64 runner 上跑通后再开启。编译内核/UEFI FD、生成真实 ESP 与 sparse 镜像、合体 BOOT 写入、
-真机启动/切换/回退，按 `PORTING-MAP.md` 第 6 节清单执行。所有脚本只写普通文件，**不碰任何设备**。
+### 本地复现完整构建（需要约 4 GB 带宽/磁盘）
 
-> ⚠️ 刷机有变砖风险。首次务必 `fastboot boot` 内存试运行、备份原厂 BOOT 并确认可还原、
-> 电量 ≥ 40%，遵守 PORTING-MAP 第 7 节全部红线（不刷 vbmeta/dtbo、不碰 B 槽、不格式化 userdata）。
+```bash
+bash port/build/port-from-upstream-release.sh --fork . --inputs /tmp/port-inputs \
+    --repo yzddmr6/xiaomipad-8pro-mainline     # 可加 --tag v1.0.0
+source /tmp/port-inputs/port-inputs.env
+bash port/build/port-build.sh --fork . --output /tmp/artifacts --target ubuntu-gnome \
+    --esp-image "$ESP_IMAGE" --root-image "$ROOT_IMAGE" --module-zip "$MODULE_ZIP"
+```
 
-另：源仓库 `NOTICE`/`LICENSES/` 为多许可（MIT + GPL-2.0-only 改编工具 + 第三方），并入
-SunUEFI（含 BSD-2-Clause-Patent 组件）前逐文件核对 SPDX/REUSE 合规。
+依赖：`zstd`、`mtools`（`mkfs.vfat`/`mcopy`）、`unzip`、`lz4`、`python3`；CI 会自动 apt 安装。
+
+## 上游一发新版会怎样
+
+| 上游变化 | 本仓库反应 |
+|---|---|
+| 发新 Release（镜像更新） | `sunuefi-sync-upstream.yml` 每周定时查 `releases/latest`，与本仓库 Release 说明里的 `<上游仓库>@<tag>` 比对，没构建过就派发 `upstream-release` 事件自动重建 |
+| 推了新 commit 但没发 Release | 不影响 —— 本仓库消费的是成品 Release，不合并源码 |
+| 想手动指定版本 | `workflow_dispatch` 填 `upstream_tag`（留空自动取 latest） |
+
+`sunuefi-build.yml` 的 `source` 默认 `upstream-release`，上述任一触发都会重新拉上游最新成品重建。
+产物里的 `upstream-release.json` / `upstream-adapt.json` 记录实际使用的 tag、commit 与每个资产 sha256，可追溯。
+
+## 真机边界（务必读）
+
+真实镜像 ≠ 真机一定能启动，仍有三个契约缺口（详见 `port/docs/PORTING-MAP.md` 第 2、6 节）：
+
+- **G1 挂载契约（当前最高风险）**：上游 v1.0.0 的 A 槽三元组里抽出的 `initramfs` 只有几十字节，
+  `upstream-adapt.json` 会标 `initramfs_suspicious: true`。刷入前必须确认 init 能挂上 `sunuefi_root`。
+- **G2**：内核 `CONFIG_EFI_STUB` / EFI Stub 是否可用。
+- **G3**：OS4.0.5 / Android 17 合体 BOOT 头兼容，须先 `piano-boot-repack probe`。
+
+刷机红线：先备份原厂 `boot_a` 全分区和分区表；绝不刷 `vbmeta`/`dtbo`/`*_b`/`persist`/`modem`；
+绝不 `--set-active=b`；不重排/格式化 `userdata`；首次先 `fastboot boot` 内存试运行。
+
+## 参考
+
+- 上游源码与成品：[yzddmr6/xiaomipad-8pro-mainline](https://github.com/yzddmr6/xiaomipad-8pro-mainline)
+- UEFI 契约/工具参考：[llfzs/Project-SunUEFI](https://github.com/llfzs/Project-SunUEFI)（非构建输入源）
