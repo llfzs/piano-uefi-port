@@ -19,7 +19,9 @@
         │  下载 + 逐个校验 sha256
         ▼
 本仓库 port/ 层（只做后处理，不改上游任何东西）
-        ├─ ESP   : 解 Android Boot Image -> Image/initramfs/DTB -> SUNUEFI-LINUXv2 -> FAT32 -> sparse
+        ├─ ESP   : 解 Android Boot Image -> 从 vendor_boot 取真 initramfs -> 本机固件四件套
+        │          （Image / board.dtb / initramfs / boot.img，boot.img = Android boot v2）
+        │          -> mkfs.vfat -S 4096 -> sparse
         ├─ Root  : root.sparse.img 原样透传（已是 Android sparse，可直接 fastboot flash）
         └─ Module: 真实 ZIP（piano/piano 账号 + sunuefi_root 挂载契约 + 分区计划 + 切换）
         ▼
@@ -30,7 +32,7 @@ GitHub Release：三产物 + manifest.json + 全局 SHA256SUMS + RELEASE-NOTES.m
 
 | # | 需求 | 落在哪 |
 |---|---|---|
-| 1 | UEFI 引导双系统 | `port/tools/port-stage-esp.py`（`SUNUEFI-LINUXv2` ESP）+ `port-switch.sh`（BootRequest 切换） |
+| 1 | UEFI 引导双系统 | `port/tools/port-native-esp.py`（本机固件四件套 `\EFI\Piano\stable\`）+ `port-switch.sh`（BootRequest 切换）；`port-stage-esp.py` 是另一套 `SUNUEFI-LINUXv2` 契约，两者不可混用 |
 | 2 | 保留 `sunuefi_esp` / `sunuefi_root` | `port/config/port-profile.json` + `port-adapt-rootfs.py` + `port-partition-plan.py`，**不动 userdata** |
 | 3 | 跟着上游更新、不冲突 | **独立仓库，无源码重叠**：`sunuefi-sync-upstream.yml` 监视上游 `releases/latest`，发现新 tag 派发 `upstream-release` 事件 |
 | 4 | 三产物包 | `port-package-artifacts.py` → 三个标准命名产物（Android sparse + manifest + SHA256SUMS） |
