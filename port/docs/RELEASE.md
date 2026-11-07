@@ -20,12 +20,36 @@
 
 | 资产 | 内容 |
 |---|---|
-| `SunUEFI-Module.zip` | Android 引导助手模块（原 `SunUEFI-Module/` 目录全部文件） |
+| `SunUEFI-Module.zip` | Android 引导助手模块（原 `SunUEFI-Module/` 目录全部文件）。解压后约 **21 MB**：Project-SunUEFI 的完整运行时（`payload/app.bin` 26.8 MB UEFI 应用、`payload/fd.bin`、`bin/piano-boot-repack|request`、`bin/e2fsck|resize2fs`、`webroot/`）**加上** port 层注入的 `/etc` 契约 |
 | `SunUEFI-ESP.zip` | `esp.sparse.img` + 目录级 `SHA256SUMS`（刷 `sunuefi_esp`） |
 | `SunUEFI-Root-<target>--*.sparse.img.zst[.partN]` | `root-<target>.sparse.img` 实际约 7.9 GiB：先 zstd 压缩到约 3.4 GiB，仍超 Release 单资产 2 GiB 上限才按 1,900,000,000 B 切卷；目录内小文件平铺发布（刷 `sunuefi_root`） |
 | `manifest.json` | 汇总清单：各资产的 sha256、源文件、状态、tag / commit / run / 上游基线 |
 | `SHA256SUMS` | **全局**校验和，覆盖所有发布资产与 `manifest.json` |
 | `RELEASE-NOTES.md` | 发布说明：构建信息、产物表、分卷还原命令、校验和全文、占位警告、刷机红线 |
+
+**为什么 Module 要接 Project-SunUEFI 的基座？** port 仓库自己造不出模块运行时：
+`payload/app.bin` 是 EDK2 交叉编译的 UEFI 应用（26.8 MB），`bin/piano-boot-repack`
+是 ARM64 native ELF，负责把 payload 无损打进 BOOT 并写 64 B BootRequest。缺了它们，
+模块只剩 `payload/etc` 里几份配置（约 8 KB），装上去**不能建分区、不能写 BootRequest、
+不能切系统**，`port-switch.sh` 一跑就 command not found。
+
+所以 `port-from-upstream-release.sh` 从 `llfzs/Project-SunUEFI` 的 release 取
+`SunUEFI-Module.tar.zst`（约 21 MB），再由 `port/tools/port-module-merge.py` 做
+「基座 + 增量」：
+
+- 基座的 `bin/`、`payload/*.bin`、`webroot/`、`customize.sh` 等原样保留（连权限位）
+- port 的 `/etc` 配置进 `payload/etc/`，账号（passwd/group/shadow）单独进
+  `payload/account/`，由 `piano-port-config.sh` **按用户名合并**——旧的
+  `cp -a payload/etc/.` 会把 rootfs 的 40+ 系统账号覆盖成一两行，uid 映射全乱
+- `service.sh` 重写：先跑 port 注入，再跑原厂扩容校验（原厂是 `|| exit 0` 短路，
+  直接往后追加永远执行不到）
+- `module.prop` 沿用基座 `id=piano_sunuefi`，同名覆盖安装，不与原模块并存抢 BOOT
+
+拿不到基座（`--skip-module` 或下载失败）时产物仍会生成，但状态是
+`PARTIAL_CONFIG_ONLY`，`port-package-artifacts.py` 会附 `README-PARTIAL.txt` 列出缺什么，
+不再像以前那样被误标成 `READY`。基座仓库/tag 可用 workflow 变量覆盖
+（`SUNUEFI_MODULE_REPO` / `SUNUEFI_MODULE_TAG`），离线时给
+`--module-base <本地 SunUEFI-Module.tar.zst>`。
 
 **为什么小产物要打成 ZIP？** 三个产物目录里各有一个同名 `SHA256SUMS`，GitHub Release 的
 asset 是平铺的，直接上传会互相覆盖。压成同名 ZIP 后每个目录自成一份，解压即得原始产物。
@@ -143,9 +167,9 @@ cd release-assets && sha256sum -c SHA256SUMS
 
 | 产物 | 内容 | 上游资产 / 来源 |
 |---|---|---|
-| `SunUEFI-ESP` | `esp.sparse.img`：FAT32 ESP 转 Android sparse，含 `SUNUEFI-LINUXv2` payload、裸 `Image`、合并 DTB、initramfs | `piano-ubuntu-<tag>-boot.zip` |
+| `SunUEFI-ESP` | `esp.sparse.img`：FAT32 ESP（4096 B/扇区）转 Android sparse，含本机固件四件套 `\EFI\Piano\stable\{Image,board.dtb,initramfs,boot.img}`（`boot.img` = Android boot v2，内嵌 DTB） | `piano-ubuntu-<tag>-boot.zip` |
 | `SunUEFI-Root-<target>` | `root-<target>.sparse.img`：60 GiB ext4 Android sparse，**原样透传** | `piano-ubuntu-<tag>-rootfs.img.zst.part*` 拼接 zstd 解压 |
-| `SunUEFI-Module` | `SunUEFI-Piano-<tag>.zip`：真实模块（`piano/piano` 账号、`fstab`、`root-policy`、分区计划、切换脚本），首次启动注入 root | `port/` 生成 |
+| `SunUEFI-Module` | `SunUEFI-Piano-<tag>.zip`：约 21 MB，Project-SunUEFI 完整运行时（UEFI payload / `piano-boot-*` / `e2fsck` / webroot）**+** port 的账号与挂载契约（`payload/etc` + `payload/account`，首启按用户名合并注入） | `llfzs/Project-SunUEFI` release 的 `SunUEFI-Module.tar.zst` + `port/` 合并 |
 
 此时 `manifest.json` 的 `status` = `RELEASE_ASSETS_READY`、发布门禁 `GUARD_CLEAR`，
 **不再是强制草稿 + 预发布**。Release 说明会写入本次消费的上游 tag，便于溯源。
@@ -191,7 +215,7 @@ workflow 再把 `--inputs/--esp-image/--root-image/--module-zip` 全量传给 `p
 | 内核源码 | fork 的 `kernel/` 只有 `abi.json`/`source.json`；真实源码在 `source.json` 指向的外部仓库 `linux-sm8750-piano@<commit>` |
 | `initramfs.cpio.gz` | `tools/build-initramfs.sh` 需 `BUSYBOX` + `GEN_INIT_CPIO`，须本机构建 |
 | `root.ext4` / `root.sparse.img` | `tools/build-rootfs-image.py` 需 sudo、apt 快照、专用 `mke2fs` + qemu-user-static |
-| `SunUEFI-Piano-*.zip` | 需 `git subtree` 引入 SunUEFI 引导层并 ARM64 交叉编译 Android 助手模块 |
+| `SunUEFI-Piano-*.zip` | 运行时（UEFI payload + `piano-boot-*`）从 `llfzs/Project-SunUEFI` 的 release 取 `SunUEFI-Module.tar.zst`，不需要本机交叉编译；port 侧只做 `/etc` 合并（`port/tools/port-module-merge.py`） |
 | 原厂 DTB overlay / 合体 BOOT / UEFI FD | **只能从你的设备提取**；Android 17 的 BOOT 头须先 `piano-boot-repack probe`（G3） |
 
 

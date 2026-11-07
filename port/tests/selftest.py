@@ -551,6 +551,77 @@ def main() -> int:
                             "partition-plan.json"):
                     assert req in names, f"Module ZIP 缺 {req}"
                 assert b"piano" in z.read("payload/etc/passwd")
+            # 无基座时必须诚实标注：这个 zip 只有配置，不能建分区/切系统
+            lim = json.loads((ur_inputs / "upstream-adapt.json").read_text())["module"]
+            assert lim["runtime"] == "CONFIG_ONLY", f"无基座却标了 {lim['runtime']}"
+            assert lim["bytes"] < 200_000, "无基座产物不该有大体积"
+
+            # ---- 带模块基座：必须产出「运行时 + 契约」的完整模块 ----
+            base_d = d / "modbase"
+            (base_d / "bin").mkdir(parents=True)
+            (base_d / "payload").mkdir()
+            (base_d / "module.prop").write_text(
+                "id=piano_sunuefi\nname=SunUEFI 引导助手\nversion=0.5.2\n"
+                "versionCode=7\nauthor=Project SunUEFI\ndescription=引导助手\n")
+            for binary in ("piano-boot-repack", "piano-boot-request"):
+                (base_d / "bin" / binary).write_bytes(b"\x7fELF" + b"\0" * 120)
+            (base_d / "payload/app.bin").write_bytes(b"UEFIAPP!" * 4096)
+            (base_d / "service.sh").write_text(
+                "#!/system/bin/sh\n[ -f /data/adb/x.json ] || exit 0\n"
+                '/system/bin/sh "$MODPATH/storage-operations.sh" verify 2>/dev/null\n')
+            base_zip = d / "SunUEFI-Piano-0.5.2.zip"
+            with zipfile.ZipFile(base_zip, "w") as z:
+                for p in sorted(base_d.rglob("*")):
+                    if p.is_file():
+                        rel = p.relative_to(base_d).as_posix()
+                        zi = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
+                        mode = 0o755 if (rel.endswith(".sh") or rel.startswith("bin/")) else 0o644
+                        zi.external_attr = (0o100000 | mode) << 16
+                        z.writestr(zi, p.read_bytes())
+
+            ur2 = d / "ur_inputs_base"
+            import shutil as _sh
+            _sh.copytree(ur_inputs, ur2)
+            (ur2 / f"SunUEFI-Piano-{tag}.zip").unlink()
+            r6 = subprocess.run([sys.executable, str(adapter), "adapt",
+                                 "--fork", str(ur_fork), "--inputs", str(ur2),
+                                 "--tag", tag, "--module-base", str(base_zip)],
+                                capture_output=True, text=True)
+            assert r6.returncode == 0, f"adapt --module-base 失败: {r6.stderr}"
+            mz = ur2 / f"SunUEFI-Piano-{tag}.zip"
+            with zipfile.ZipFile(mz) as z:
+                names = z.namelist()
+                # 基座运行时必须原样保留，不能只剩配置
+                for req in ("bin/piano-boot-repack", "bin/piano-boot-request",
+                            "payload/app.bin", "piano-port-config.sh"):
+                    assert req in names, f"合并后缺运行时 {req}"
+                # port 契约按「账号 / 其余配置」分开放
+                for req in ("payload/account/passwd", "payload/account/shadow",
+                            "payload/etc/fstab"):
+                    assert req in names, f"合并后缺契约 {req}"
+                assert "payload/etc/passwd" not in names, \
+                    "账号必须放 payload/account（按用户名合并），不能混进 payload/etc"
+                assert (z.getinfo("bin/piano-boot-repack").external_attr >> 16) & 0o777 == 0o755, \
+                    "运行时权限位在重打包时丢了"
+                svc = z.read("service.sh").decode()
+                assert "piano-port-config.sh" in svc, "service.sh 没挂 port 注入"
+                assert "storage-operations.sh" in svc, "原厂扩容校验被覆盖掉了"
+                prop = z.read("module.prop").decode()
+                assert "id=piano_sunuefi" in prop, "必须沿用基座 id（同名覆盖，不并存）"
+                assert f"+port.{tag}" in prop, "version 未带 port 后缀"
+            full = json.loads((ur2 / "upstream-adapt.json").read_text())["module"]
+            assert full["runtime"] == "FULL", f"有基座却标了 {full['runtime']}"
+
+            # 打包器要能自己认出空壳（不能因为「zip 存在」就判 READY）
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "ppa", portroot / "tools/port-package-artifacts.py")
+            ppa = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(ppa)
+            assert ppa.module_runtime_state(mz)[0] == "FULL"
+            shell_state, shell_missing = ppa.module_runtime_state(modzip)
+            assert shell_state == "CONFIG_ONLY" and shell_missing, \
+                "8 KB 配置包被判成完整模块，发布门禁会放行空壳"
             print("  [upstream-release] 解 Boot Image / ESP payload / 真实 Module / 契约 OK")
 
     print("\nSELFTEST OK —— 需求 1/2/3/4/5/7 + 上游 Release 接线 + 真实编译接线 + 发布门禁 全部离线跑通")

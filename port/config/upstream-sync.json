@@ -35,6 +35,7 @@
       "port/tools/port-switch.sh",
       "port/tools/port-release-assets.py",
       "port/tools/port-upstream-release.py",
+      "port/tools/port-module-merge.py",
       "port/config/release-policy.json",
       "port/build/port-build.sh",
       "port/build/port-full-build.sh",
@@ -46,8 +47,8 @@
     "与本仓库已发布 Release 说明里的 <上游仓库>@<tag> 比对去重",
     "发现新 tag -> POST repository_dispatch(event_type=upstream-release) 派发重建",
     "sunuefi-build.yml 默认 source=upstream-release：port/build/port-from-upstream-release.sh 下载 boot.zip / rootfs 分卷 / tools.zip 并校验 SHA256SUMS.assets",
-    "port/tools/port-upstream-release.py 解 Android Boot Image -> Image/initramfs/DTB -> SUNUEFI-LINUXv2 ESP",
-    "root.sparse.img 原样透传；账号与挂载契约打进真实 Module ZIP",
+    "port/tools/port-upstream-release.py 解 Android Boot Image -> Image/initramfs/DTB -> 本机固件四件套 ESP",
+    "root.sparse.img 原样透传；账号与挂载契约合并进 Project-SunUEFI 的完整模块基座（SunUEFI-Module.tar.zst）",
     "port-package-artifacts.py 产出三产物；port-release-assets.py 对大镜像自动分卷",
     "发布门禁：占位产物强制草稿+预发布；真镜像 GUARD_CLEAR 正常发布",
     "高级可选 source=kernel-source：需自备上游源码工作树（--upstream-src），本仓库不含 kernel/"

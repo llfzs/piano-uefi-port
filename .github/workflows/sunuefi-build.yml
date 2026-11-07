@@ -160,12 +160,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_REPO: yzddmr6/xiaomipad-8pro-mainline
+          # Android 模块基座：port 仓库造不出 payload/app.bin（EDK2 交叉编译）与
+          # piano-boot-* 等 native ELF，只能消费 Project-SunUEFI 的 release 产物，
+          # 再把 port 的 /etc 契约合并进去。拿掉它，产物模块会退化成 8 KB 空壳。
+          MODULE_REPO: ${{ vars.SUNUEFI_MODULE_REPO || 'llfzs/Project-SunUEFI' }}
+          MODULE_TAG: ${{ vars.SUNUEFI_MODULE_TAG || '' }}
         run: |
           set -euo pipefail
           PORT_INPUTS="$RUNNER_TEMP/port-inputs"
           mkdir -p "$PORT_INPUTS"
-          ARGS=(--fork "$PWD" --inputs "$PORT_INPUTS" --repo "$UPSTREAM_REPO")
+          ARGS=(--fork "$PWD" --inputs "$PORT_INPUTS" --repo "$UPSTREAM_REPO"
+                --module-repo "$MODULE_REPO")
           if [ -n "$UPSTREAM_TAG" ]; then ARGS+=(--tag "$UPSTREAM_TAG"); fi
+          if [ -n "$MODULE_TAG" ]; then ARGS+=(--module-tag "$MODULE_TAG"); fi
           if [ "$SKIP_ROOT" = '1' ]; then ARGS+=(--skip-root); fi
           bash port/build/port-from-upstream-release.sh "${ARGS[@]}"
           # shellcheck disable=SC1090
@@ -182,6 +189,7 @@ jobs:
             echo "- 上游 tag: \`${UPSTREAM_TAG:-latest}\`（未写死，自动跟随上游最新）"
             echo "- 上游仓库: \`$UPSTREAM_REPO\`"
             echo "- 状态: \`${FULL_BUILD_STATUS:-UNKNOWN}\`"
+            echo "- 模块基座: \`$MODULE_REPO\`（含 payload/app.bin 与 native 工具）"
             echo "- 说明: 消费上游按 tag 发布的编译成品，经 port/ 层 UEFI 化；不重编内核"
           } >> "$GITHUB_STEP_SUMMARY"
 

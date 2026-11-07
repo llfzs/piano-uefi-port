@@ -23,7 +23,8 @@
         │          （Image / board.dtb / initramfs / boot.img，boot.img = Android boot v2）
         │          -> mkfs.vfat -S 4096 -> sparse
         ├─ Root  : root.sparse.img 原样透传（已是 Android sparse，可直接 fastboot flash）
-        └─ Module: 真实 ZIP（piano/piano 账号 + sunuefi_root 挂载契约 + 分区计划 + 切换）
+        └─ Module: Project-SunUEFI 完整基座（payload/app.bin + piano-boot-* + e2fsck
+                   + webroot，约 21 MB）+ port 的账号/挂载契约增量合并
         ▼
 GitHub Release：三产物 + manifest.json + 全局 SHA256SUMS + RELEASE-NOTES.md
 ```
@@ -36,7 +37,7 @@ GitHub Release：三产物 + manifest.json + 全局 SHA256SUMS + RELEASE-NOTES.m
 | 2 | 保留 `sunuefi_esp` / `sunuefi_root` | `port/config/port-profile.json` + `port-adapt-rootfs.py` + `port-partition-plan.py`，**不动 userdata** |
 | 3 | 跟着上游更新、不冲突 | **独立仓库，无源码重叠**：`sunuefi-sync-upstream.yml` 监视上游 `releases/latest`，发现新 tag 派发 `upstream-release` 事件 |
 | 4 | 三产物包 | `port-package-artifacts.py` → 三个标准命名产物（Android sparse + manifest + SHA256SUMS） |
-| 5 | 账号/密码 `piano`/`piano`、root=`piano` | `port-inject-login.py` 生成的配置打进 Module ZIP，首次启动注入 |
+| 5 | 账号/密码 `piano`/`piano`、root=`piano` | `port-inject-login.py` 生成配置，`port-module-merge.py` 合进模块基座，`piano-port-config.sh` 首启**按用户名合并**注入（不覆盖 rootfs 系统账号） |
 | 6 | GitHub Actions 构建 | `.github/workflows/sunuefi-build.yml`（默认 `source=upstream-release`） |
 | 7 | 构建产物推到 Release | `sunuefi-build.yml#publish` + `sunuefi-release.yml`（补发）+ `port-release-assets.py`（大镜像自动分卷）+ 发布门禁 |
 

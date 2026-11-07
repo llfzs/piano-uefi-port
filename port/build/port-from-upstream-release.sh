@@ -13,16 +13,22 @@
 #   2. download : 按 role 下载 *-boot.zip / *-tools.zip / *-rootfs.img.zst.part*
 #                 + SHA256SUMS.assets / assets-manifest.json，逐个 sha256 校验
 #   3. rootfs   : cat part* | zstd -d > root.sparse.img（已是 android sparse，原样透传）
-#   4. adapt    : 解 boot 三元组 -> Image/initramfs/DTB -> 本机固件四件套 ESP
+#   4. tools/boot: 解上游 boot.zip / tools.zip
+#   5. module   : 取 Project-SunUEFI 的 SunUEFI-Module.tar.zst 作模块基座
+#                 （含 payload/app.bin、bin/piano-boot-repack 等运行时；port 层的
+#                  /etc 契约作为增量合并进去，不再是 8 KB 的空壳配置包）
+#   6. adapt    : 解 boot 三元组 -> Image/initramfs/DTB -> 本机固件四件套 ESP
 #                 （Image / board.dtb / initramfs / boot.img，boot.img = Android boot v2）
-#                 -> 生成含 piano/piano 与 sunuefi_root 契约的真实 Module ZIP
-#   5. esp.raw  : mkfs.vfat -S 4096（对齐原厂 4 KiB 扇区）+ mcopy 打成 FAT32 镜像
-#   6. 输出 port-inputs.env（与 workflow 契约一致）+ upstream-release.json / upstream-adapt.json
+#   7. esp.raw  : mkfs.vfat -S 4096（对齐原厂 4 KiB 扇区）+ mcopy 打成 FAT32 镜像
+#
+# 输出 port-inputs.env（与 workflow 契约一致）+ upstream-release.json / upstream-adapt.json
 #
 # 用法：
 #   ./port-from-upstream-release.sh --fork <本仓库根> --inputs <产物目录> \
 #       [--repo yzddmr6/xiaomipad-8pro-mainline] [--tag <留空=latest>] \
-#       [--skip-root] [--fixture <本地资产目录>] [--force]
+#       [--module-base <SunUEFI-Module.tar.zst>] \
+#       [--module-repo <owner/repo>] [--module-tag <tag>] [--module-sha256 <hex>] \
+#       [--skip-root] [--skip-module] [--fixture <本地资产目录>] [--force]
 #
 # 依赖（GitHub Actions ubuntu-24.04-arm 上可 apt 安装）：
 #   curl, unzip, zstd, mkfs.vfat, mcopy(mtools), sha256sum, python3
@@ -35,6 +41,11 @@ die()  { printf '\033[31m[FATAL]\033[0m %s\n' "$*" >&2; exit 1; }
 
 FORK=""; INPUTS=""; REPO="yzddmr6/xiaomipad-8pro-mainline"; TAG=""
 SKIP_ROOT=0; FIXTURE=""; FORCE=0; ESP_SIZE_MIB=512
+# 模块基座：Project-SunUEFI 构建的 Android 引导助手（21 MB，含 UEFI payload 与
+# native 工具）。port 仓库自己造不出 payload/app.bin（需 EDK2 交叉编译），
+# 所以这里直接消费它的 release 产物，再把 port 的 /etc 契约合并进去。
+MODULE_BASE=""; MODULE_REPO="llfzs/Project-SunUEFI"; MODULE_TAG=""
+MODULE_SHA256=""; SKIP_MODULE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --fork) FORK="$2"; shift 2;;
@@ -43,7 +54,12 @@ while [ $# -gt 0 ]; do
     --tag) TAG="$2"; shift 2;;
     --esp-size-mib) ESP_SIZE_MIB="$2"; shift 2;;
     --fixture) FIXTURE="$2"; shift 2;;
+    --module-base) MODULE_BASE="$2"; shift 2;;
+    --module-repo) MODULE_REPO="$2"; shift 2;;
+    --module-tag) MODULE_TAG="$2"; shift 2;;
+    --module-sha256) MODULE_SHA256="$2"; shift 2;;
     --skip-root) SKIP_ROOT=1; shift;;
+    --skip-module) SKIP_MODULE=1; shift;;
     --force) FORCE=1; shift;;
     *) die "未知参数: $1";;
   esac
@@ -63,7 +79,7 @@ CACHE="$INPUTS/_assets"
 mkdir -p "$CACHE"
 
 # ---------------------------------------------------------------- 1) resolve
-info "[1/6] 解析上游最新 Release（repo=$REPO, tag=${TAG:-latest}）"
+info "[1/7] 解析上游最新 Release（repo=$REPO, tag=${TAG:-latest}）"
 if [ -n "$FIXTURE" ]; then
   [ -d "$FIXTURE" ] || die "--fixture 目录不存在: $FIXTURE"
   cp -f "$FIXTURE"/upstream-release.json "$INPUTS/" 2>/dev/null || \
@@ -83,15 +99,22 @@ for p in sorted(f.iterdir()):
     "name": tag, "assets": assets, "note": "离线 fixture，用于自检转换链路",
 }, indent=2, ensure_ascii=False) + "\n")
 PY
-  info "  fixture 模式：跳过 GitHub API（tag=$(python3 -c "import json;print(json.load(open('$INPUTS/upstream-release.json'))['tag'])")）"
+  # 注意：路径必须走 argv，不能内插进 python 单行源码。Windows/MSYS 会把
+  # /h/... 转成 H:\...，反斜杠进到 Python 字符串里会变成 \t、\n 等转义，
+  # 路径被悄悄改坏（CI 在 Linux 上不触发，本机 fixture 自检必踩）。
+  info "  fixture 模式：跳过 GitHub API（tag=$(python3 -c \
+    "import json,sys;print(json.load(open(sys.argv[1],encoding='utf-8'))['tag'])" \
+    "$INPUTS/upstream-release.json")）"
 else
   python3 "$ADAPTER" resolve --repo "$REPO" --tag "$TAG" --inputs "$INPUTS"
 fi
-UP_TAG=$(python3 -c "import json;print(json.load(open('$INPUTS/upstream-release.json'))['tag'])")
+UP_TAG=$(python3 -c \
+  "import json,sys;print(json.load(open(sys.argv[1],encoding='utf-8'))['tag'])" \
+  "$INPUTS/upstream-release.json")
 info "  上游版本 = $UP_TAG"
 
 # ------------------------------------------------------------- 2) 下载 + 校验
-info "[2/6] 获取上游资产并校验 SHA256SUMS.assets"
+info "[2/7] 获取上游资产并校验 SHA256SUMS.assets"
 if [ -n "$FIXTURE" ]; then
   cp -f "$FIXTURE"/* "$CACHE"/ 2>/dev/null || true
   cp -f "$CACHE/SHA256SUMS.assets" "$INPUTS/" 2>/dev/null || true
@@ -134,7 +157,7 @@ done < "$CACHE/SHA256SUMS.assets"
 [ "$CHECKED" -gt 0 ] || warn "SHA256SUMS.assets 中没有命中已下载资产（fixture 可能未提供校验文件）"
 
 # ------------------------------------------------------------ 3) rootfs 分卷
-info "[3/6] 拼接 rootfs 分卷并解压为 root.sparse.img"
+info "[3/7] 拼接 rootfs 分卷并解压为 root.sparse.img"
 if [ "$SKIP_ROOT" = 1 ]; then
   warn "  --skip-root：跳过 3.5GB 分卷下载/解压（仅用于快速验证链路）"
   ROOT_STATE="SKIPPED"
@@ -169,7 +192,7 @@ PY
 fi
 
 # ------------------------------------------------------------ 4) tools/boot 解包
-info "[4/6] 解上游 boot.zip / tools.zip"
+info "[4/7] 解上游 boot.zip / tools.zip"
 cp -f "$CACHE"/*-boot.zip "$INPUTS/" 2>/dev/null || die "缺 *-boot.zip"
 command -v unzip >/dev/null 2>&1 || die "缺 unzip"
 mkdir -p "$INPUTS/boot-unpacked" "$INPUTS/tools-unpacked"
@@ -179,12 +202,94 @@ for t in "$CACHE"/*-tools.zip; do
 done
 info "  boot 成员: $(find "$INPUTS/boot-unpacked" -type f | wc -l) 个"
 
-# ---------------------------------------------------------------- 5) adapt
-info "[5/6] UEFI 化适配（内核/DTB/initramfs -> ESP + Module）"
-python3 "$ADAPTER" adapt --fork "$FORK" --inputs "$INPUTS" --repo "$REPO" --tag "$UP_TAG"
+# ------------------------------------------------------- 5) 模块基座（运行时）
+# port 仓库造不出 payload/app.bin（EDK2 交叉编译），也造不出 piano-boot-repack 等
+# native ELF。自己拼出来的「Module ZIP」只有 8 KB 配置文本，装上去既不能建分区也
+# 不能写 BootRequest。所以这里取 Project-SunUEFI 的 release 产物当基座，后面由
+# port-module-merge.py 把 /etc 契约合并进去。
+info "[5/7] 取 Android 模块基座（Project-SunUEFI）"
+if [ "$SKIP_MODULE" = 1 ]; then
+  warn "  --skip-module：产物模块将退化为只含配置的轻量包（不能建分区/切系统）"
+  MODULE_BASE=""
+elif [ -n "$MODULE_BASE" ]; then
+  [ -f "$MODULE_BASE" ] || die "--module-base 不存在: $MODULE_BASE"
+  info "  使用本地基座: $MODULE_BASE"
+else
+  MODULE_ASSET="SunUEFI-Module.tar.zst"
+  MODULE_BASE="$CACHE/$MODULE_ASSET"
+  if [ -f "$MODULE_BASE" ]; then
+    info "  复用已下载基座: $MODULE_BASE"
+  else
+    # Project-SunUEFI 的产物目前全部发成 prerelease，GitHub 的
+    # /releases/latest 只指向最新「正式」release，会 404。所以先试 latest，
+    # 失败再列表里取第一个含该资产的 tag（含 prerelease，跳过 draft）。
+    MODULE_URL=$(python3 - "$MODULE_REPO" "$MODULE_ASSET" "${MODULE_TAG:-}" \
+                           "${GH_TOKEN:-${GITHUB_TOKEN:-}}" <<'PY'
+import json, sys, urllib.error, urllib.request
+repo, asset, tag, token = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+base = f"https://api.github.com/repos/{repo}"
+hdr = {"Accept": "application/vnd.github+json", "User-Agent": "piano-uefi-port"}
+if token:
+    hdr["Authorization"] = f"Bearer {token}"
+def get(url):
+    return json.load(urllib.request.urlopen(
+        urllib.request.Request(url, headers=hdr), timeout=30))
+def find(rel):
+    for a in rel.get("assets", []):
+        if a.get("name") == asset:
+            return a.get("browser_download_url") or a.get("url")
+    return None
+if tag:
+    try:
+        u = find(get(f"{base}/releases/tags/{tag}"))
+        if u:
+            print(u); sys.exit(0)
+    except urllib.error.HTTPError as e:
+        print(f"release {tag} 不可读: {e}", file=sys.stderr)
+try:
+    u = find(get(f"{base}/releases/latest"))
+    if u:
+        print(u); sys.exit(0)
+except urllib.error.HTTPError:
+    pass
+for rel in get(f"{base}/releases?per_page=30"):
+    if rel.get("draft"):
+        continue
+    u = find(rel)
+    if u:
+        print(f"选中 {repo}@{rel['tag_name']}（prerelease={rel.get('prerelease')}）",
+              file=sys.stderr)
+        print(u); sys.exit(0)
+print(f"{repo} 的 release 里没有 {asset}", file=sys.stderr)
+sys.exit(1)
+PY
+) || die "模块基座解析失败（$MODULE_REPO 的 release 里没有 $MODULE_ASSET）。
+     可用 --module-base <本地文件> 或 --skip-module 绕过"
+    info "  下载 $MODULE_URL"
+    curl -sSL --fail --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 900 \
+      -o "$MODULE_BASE" "$MODULE_URL" \
+      || die "模块基座下载失败: $MODULE_URL"
+  fi
+fi
+
+if [ -n "$MODULE_BASE" ]; then
+  MODULE_BYTES=$(stat -c %s "$MODULE_BASE")
+  [ "$MODULE_BYTES" -gt 5000000 ] || die "模块基座过小（${MODULE_BYTES}B），不是含运行时的 SunUEFI-Module"
+  MODULE_BASE_SHA=$(sha256sum "$MODULE_BASE" | cut -d' ' -f1)
+  if [ -n "$MODULE_SHA256" ] && [ "$MODULE_BASE_SHA" != "$MODULE_SHA256" ]; then
+    die "模块基座 SHA256 不匹配（期望 $MODULE_SHA256，实际 $MODULE_BASE_SHA）"
+  fi
+  info "  基座 $(echo $MODULE_BYTES | awk '{printf "%.1f MiB", $1/1048576}') sha256=${MODULE_BASE_SHA:0:16}…"
+fi
+
+# ---------------------------------------------------------------- 6) adapt
+info "[6/7] UEFI 化适配（内核/DTB/initramfs -> ESP + Module）"
+ADAPT_ARGS=(--fork "$FORK" --inputs "$INPUTS" --repo "$REPO" --tag "$UP_TAG")
+[ -n "$MODULE_BASE" ] && ADAPT_ARGS+=(--module-base "$MODULE_BASE")
+python3 "$ADAPTER" adapt "${ADAPT_ARGS[@]}"
 
 # ------------------------------------------------------------- 6) ESP FAT32
-info "[6/6] 把 ESP 目录打成 FAT32 raw 镜像"
+info "[7/7] 把 ESP 目录打成 FAT32 raw 镜像"
 for t in truncate mkfs.vfat mcopy; do
   command -v "$t" >/dev/null 2>&1 || die "缺 $t（CI 请 apt-get install -y mtools）"
 done
@@ -203,10 +308,10 @@ sed -i "s|^ESP_IMAGE=.*|ESP_IMAGE=\"$ESPIMG\"|" "$INPUTS/port-inputs.env"
 grep -q '^ROOT_STATE=' "$INPUTS/port-inputs.env" || echo "ROOT_STATE=\"$ROOT_STATE\"" >> "$INPUTS/port-inputs.env"
 info "  esp.raw = ${SZ}B (${ESP_SIZE_MIB}MiB)"
 
-python3 - "$INPUTS" "$UP_TAG" "$REPO" "$ROOT_STATE" <<'PY'
+python3 - "$INPUTS" "$UP_TAG" "$REPO" "$ROOT_STATE" "${MODULE_BASE:-}" "${MODULE_BASE_SHA:-}" "${MODULE_REPO}" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
-d, tag, repo, root_state = Path(sys.argv[1]), *sys.argv[2:5]
+d, tag, repo, root_state, module_base, module_sha, module_repo = Path(sys.argv[1]), *sys.argv[2:8]
 def sha(p):
     h = hashlib.sha256()
     with open(p, "rb") as f:
@@ -223,6 +328,8 @@ mp = d / "upstream-adapt.json"
 r = json.loads(mp.read_text()) if mp.is_file() else {}
 r.update({"upstream_tag": tag, "upstream_repo": repo,
           "root_state": root_state, "real_images": files,
+          "module_base": {"path": module_base, "sha256": module_sha, "repo": module_repo}
+                          if module_base else None,
           "status": "READY" if "esp.raw" in files and "root.sparse.img" in files
                     else "PARTIAL_NO_ROOT"})
 mp.write_text(json.dumps(r, indent=2, ensure_ascii=False) + "\n")

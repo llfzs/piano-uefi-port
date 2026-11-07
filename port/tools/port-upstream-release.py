@@ -232,13 +232,10 @@ def sha256(data: bytes) -> str:
 
 
 # ---------------------------------------------------------------- module zip
+# 仅在 --skip-module / 拿不到模块基座时使用：只含配置文本，没有运行时。
 MODULE_SERVICE = r'''#!/system/bin/sh
-# SunUEFI port / piano firstboot injection.
-# Runs on the Android side (KernelSU/Magisk module service.sh).
-# The Linux root image is the unmodified upstream root.sparse.img (60 GiB ext4).
-# We mount sunuefi_root once and inject the account + mount contract that the
-# upstream image does not carry (upstream has no user account and uses
-# PARTLABEL=linux_rootfs / linux_data).
+# SunUEFI port / piano firstboot injection（轻量包：只注入账号与挂载契约）。
+# 本包不含 payload/app.bin 与 bin/piano-*，不能建分区、不能写 BootRequest。
 MODDIR=${MODDIR:-${0%/*}}
 ROOTDEV=/dev/block/by-name/sunuefi_root
 [ -e "$ROOTDEV" ] || exit 0
@@ -248,7 +245,32 @@ mkdir -p "$MNT" 2>/dev/null || exit 0
 mount -t ext4 -o rw "$ROOTDEV" "$MNT" 2>/dev/null || exit 0
 if [ ! -f "$MNT$FLAG" ]; then
     mkdir -p "$MNT/etc/piano" "$MNT/home/piano"
-    cp -a "$MODDIR/payload/etc/." "$MNT/etc/" 2>/dev/null
+    # 账号按用户名合并，不能整体覆盖：rootfs 的 root/daemon/nobody 等系统账号
+    # 被冲掉会让 uid 映射错乱（systemd/dbus/polkit 起不来）。
+    for f in passwd group shadow; do
+        src="$MODDIR/payload/etc/$f"; dst="$MNT/etc/$f"
+        [ -f "$src" ] || continue
+        [ -f "$dst" ] || : > "$dst"
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            key=$(printf '%s' "$line" | cut -d: -f1)
+            [ -n "$key" ] || continue
+            if grep -q "^$key:" "$dst" 2>/dev/null; then
+                awk -v k="$key" -v v="$line" '{
+                    n = index($0, ":"); if (n > 0 && substr($0,1,n-1) == k) print v; else print
+                }' "$dst" > "$dst.port" && mv -f "$dst.port" "$dst"
+            else
+                printf '%s\n' "$line" >> "$dst"
+            fi
+        done < "$src"
+    done
+    for rel in fstab gdm3/custom.conf sudoers.d/10-piano-port \
+               udev/rules.d/01-piano-protect-android.rules piano/root-policy.json; do
+        src="$MODDIR/payload/etc/$rel"
+        [ -f "$src" ] || continue
+        case "$rel" in */*) mkdir -p "$MNT/etc/${rel%/*}" 2>/dev/null ;; esac
+        cp -f "$src" "$MNT/etc/$rel" 2>/dev/null || true
+    done
     chown 1000:1000 "$MNT/home/piano" 2>/dev/null
     touch "$MNT$FLAG" 2>/dev/null
 fi
@@ -261,12 +283,22 @@ name=SunUEFI Piano
 version={version}
 versionCode=1
 author=Project-SunUEFI port
-description=Create sunuefi_esp/sunuefi_root, inject piano/piano login and write BootRequest
+description=CONFIG ONLY (no runtime): inject piano login + sunuefi_root mount contract. Partition create / BootRequest / OS switch need the full SunUEFI-Module from the Project-SunUEFI release.
 """
 
 
-def build_module_zip(fork: Path, inputs: Path, tag: str, out: Path) -> dict:
-    """用已有的 inject-login / adapt-rootfs 产出真实配置文件，打进 Module ZIP。"""
+def build_module_zip(fork: Path, inputs: Path, tag: str, out: Path,
+                     base: Path | None = None) -> dict:
+    """生成 Android 模块 ZIP。
+
+    base 给了（Project-SunUEFI 的 SunUEFI-Module.tar.zst）→ 走「基座 + 增量」：
+    原样保留 payload/app.bin（UEFI 应用 26.8 MB）、bin/piano-boot-{repack,request}
+    （改 BOOT / 写 BootRequest）、bin/e2fsck+resize2fs（扩容）、webroot（WebUI），
+    再把 port 的账号与挂载契约合并进去。产物约 21 MB。
+
+    base 没给 → 退回只含配置文本的轻量包（约 8 KB），状态显式标 PARTIAL_CONFIG_ONLY，
+    不假装它是能建分区/切系统的引导助手。
+    """
     import shutil
     import tempfile
 
@@ -287,6 +319,24 @@ def build_module_zip(fork: Path, inputs: Path, tag: str, out: Path) -> dict:
         subprocess.run([sys.executable, str(fork / "port/tools/port-adapt-rootfs.py"),
                         "--rootfs", str(rootfs), "--profile", str(profile)],
                        check=True, capture_output=True, text=True)
+
+        if base is not None:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            merge = fork / "port/tools/port-module-merge.py"
+            if not merge.is_file():
+                raise SystemExit(f"缺模块合并工具: {merge}")
+            r = subprocess.run([sys.executable, str(merge),
+                                "--base", str(base),
+                                "--payload", str(rootfs / "etc"),
+                                "--out", str(out), "--tag", tag, "--json"],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise SystemExit(f"模块基座合并失败:\n{r.stderr}")
+            info = json.loads(r.stdout)
+            return {"path": str(out), "bytes": out.stat().st_size,
+                    "sha256": _file_sha(out), "status": info["status"],
+                    "base": info["base"], "module_prop": info["module_prop"],
+                    "runtime": "FULL"}
 
         mod = stage / "module"
         payload_etc = mod / "payload/etc"
@@ -317,7 +367,10 @@ def build_module_zip(fork: Path, inputs: Path, tag: str, out: Path) -> dict:
                                          date_time=(1980, 1, 1, 0, 0, 0))
                     zi.external_attr = (0o755 if p.suffix == ".sh" else 0o644) << 16
                     z.writestr(zi, p.read_bytes())
-    return {"path": str(out), "bytes": out.stat().st_size, "sha256": _file_sha(out)}
+    return {"path": str(out), "bytes": out.stat().st_size, "sha256": _file_sha(out),
+            "status": "PARTIAL_CONFIG_ONLY", "runtime": "CONFIG_ONLY",
+            "note": "无模块基座：只含 /etc 配置，建分区/写 BootRequest/切系统需要 "
+                    "Project-SunUEFI 的 SunUEFI-Module"}
 
 
 def _file_sha(p: Path) -> str:
@@ -445,9 +498,22 @@ def cmd_adapt(a) -> int:
     for msg in (r.stderr or "").strip().splitlines():
         log("  " + msg)
 
-    # 4) Module ZIP（真实内容：账号 + fstab + root-policy + 分区计划 + 切换）
+    # 4) Module ZIP
+    #    有基座 → "基座 + 增量"：Project-SunUEFI 的完整运行时（payload/app.bin、
+    #    piano-boot-repack/request、e2fsck/resize2fs、webroot）原样保留，再合并
+    #    port 的账号与挂载契约，约 21 MB。
+    #    无基座 → 只含配置文本的轻量包，状态显式标 PARTIAL_CONFIG_ONLY。
     module_zip = inputs / f"SunUEFI-Piano-{tag}.zip"
-    minfo = build_module_zip(fork, inputs, tag, module_zip)
+    module_base = (getattr(a, "module_base", "") or "").strip()
+    if module_base and not Path(module_base).is_file():
+        raise SystemExit(f"--module-base 不存在: {module_base}")
+    minfo = build_module_zip(fork, inputs, tag, module_zip,
+                             Path(module_base) if module_base else None)
+    if minfo.get("runtime") == "FULL":
+        log(f"  模块：基座 {minfo['base']['base_module_zip']} + port 契约 "
+            f"-> {minfo['bytes'] / 2**20:.1f} MiB（运行时完整）")
+    else:
+        log(f"  !! 模块：无基座，只有 {minfo['bytes']}B 配置文本（不能建分区/切系统）")
 
     # 5) root 镜像：上游 root.sparse.img 已是 Android sparse，原样透传
     root_candidates = [inputs / "root.sparse.img", inputs / "root.ext4", inputs / "root.image"]
@@ -477,8 +543,13 @@ def cmd_adapt(a) -> int:
         "".join(f"{k}={shlex.quote(str(v))}\n" for k, v in env.items()), encoding="utf-8")
 
     note = ("root 镜像为上游 root.sparse.img 原样透传；piano/piano 账号与 "
-            "sunuefi_root 挂载契约由 Module ZIP 的 service.sh 首次启动时注入。"
+            "sunuefi_root 挂载契约由 Module ZIP 的 piano-port-config.sh 首次启动时"
+            "按用户名合并注入（不覆盖 rootfs 原有系统账号）。"
             "真机引导需验证 G1 挂载 / G2 EFI Stub / G3 OS4.0.5 BOOT 头兼容。")
+    if minfo.get("runtime") != "FULL":
+        note += ("【模块不完整】未提供 --module-base：该 Module ZIP 只有配置文本，"
+                 "没有 payload/app.bin 与 piano-boot-*，不能建分区、写 BootRequest "
+                 "或切换系统；需配合 Project-SunUEFI 的 SunUEFI-Module 使用。")
 
     report = {
         "status": env["FULL_BUILD_STATUS"],
@@ -520,6 +591,10 @@ def main() -> int:
     d.add_argument("--inputs", required=True)
     d.add_argument("--repo", default=DEFAULT_REPO)
     d.add_argument("--tag", default="")
+    d.add_argument("--module-base", default="",
+                   dest="module_base",
+                   help="Project-SunUEFI 的 SunUEFI-Module.tar.zst（含 payload/app.bin "
+                        "与 native 工具）。不给则只产配置包（不能建分区/切系统）")
     d.set_defaults(func=cmd_adapt)
 
     a = ap.parse_args()

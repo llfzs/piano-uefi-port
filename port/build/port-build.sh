@@ -102,6 +102,12 @@ python3 "$TOOLS/port-partition-plan.py" --profile "$PROFILE" --output "$WORK/pla
 info "[4/5] 打包三产物（SunUEFI-Module / -ESP / -Root-<target>）"
 PKG_ARGS=(--profile "$PROFILE" --distros "$DISTROS" --output "$OUTPUT" --force)
 [ -n "$TARGET" ] && PKG_ARGS+=(--target "$TARGET")
+# 产物名带上游 tag（SunUEFI-Piano-v1.0.0.zip），别所有版本都叫 0.0.0-port。
+# 值来自上游构建阶段写的 port-inputs.env，没有就退回默认。
+if [ -n "$INPUTS" ] && [ -f "$INPUTS/port-inputs.env" ]; then
+  VER=$(sed -n 's/^UPSTREAM_TAG=["]*\([^"]*\)["]*$/\1/p' "$INPUTS/port-inputs.env" | head -1)
+  [ -n "${VER:-}" ] && PKG_ARGS+=(--version "$VER")
+fi
 [ -n "$MODULE_ZIP" ] && [ -f "$MODULE_ZIP" ] && PKG_ARGS+=(--module-zip "$MODULE_ZIP") || warn "无 Module ZIP，产物将是占位骨架"
 [ -n "$ESP_IMAGE" ] && [ -f "$ESP_IMAGE" ] && PKG_ARGS+=(--esp-image "$ESP_IMAGE") || warn "无 ESP 镜像，产物将是占位骨架"
 [ -n "$ROOT_IMAGE" ] && [ -f "$ROOT_IMAGE" ] && PKG_ARGS+=(--root-image "$ROOT_IMAGE") || warn "无 root 镜像，产物将是占位骨架"

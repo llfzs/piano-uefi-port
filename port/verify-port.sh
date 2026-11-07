@@ -36,7 +36,7 @@ for f in \
   tools/port-stage-esp.py tools/port-adapt-rootfs.py tools/port-partition-plan.py \
   tools/port-inject-login.py tools/port-package-artifacts.py tools/port-release-assets.py \
   tools/port-check-isolation.py tools/port-sync-upstream.sh tools/port-switch.sh \
-  tools/port-upstream-release.py tools/port-native-esp.py \
+  tools/port-upstream-release.py tools/port-native-esp.py tools/port-module-merge.py \
   tools/native/pianoinit.sh tools/native/piano-root-fixup.sh \
   tools/native/make-esp-image.py tools/native/deploy-esp.sh tools/native/rollback-esp.sh \
   build/port-build.sh build/port-full-build.sh build/port-from-upstream-release.sh \

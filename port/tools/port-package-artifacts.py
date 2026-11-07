@@ -17,7 +17,8 @@ Android sparse 编码与 SunUEFI tools/package_sparse_images.py 逐字段对齐�
 本脚本只写普通文件，不碰设备、不执行 fastboot。离线可跑、可自检。
 输入（均可选，缺省则生成带 status=PLACEHOLDER 的空 artifact 骨架 + 说明，
 便于「同步上游后先把 CI 骨架跑绿」）：
-  --module-zip   SunUEFI 引导助手模块 ZIP
+  --module-zip   SunUEFI 引导助手模块 ZIP（应含 payload/app.bin 与 bin/piano-boot-*；
+                 只有配置文本的包会被标成 PARTIAL_CONFIG_ONLY，不进 READY）
   --esp-image    FAT32 ESP 的 raw 镜像（或已编码的 .sparse.img）
   --root-image   ext4 root 的 raw 镜像（或已编码的 .sparse.img）
 """
@@ -26,6 +27,7 @@ import hashlib
 import json
 import struct
 import sys
+import zipfile
 from pathlib import Path
 
 MAGIC = 0xed26ff3a
@@ -33,6 +35,29 @@ RAW, FILL = 0xCAC1, 0xCAC2
 BLOCK = 4096
 SPARSE_HEADER = struct.Struct("<IHHHHIIII")  # 28 bytes
 CHUNK_HEADER = struct.Struct("<HHII")        # 12 bytes
+
+# 模块能真正干活的三个前提：UEFI 应用本体 + 改 BOOT + 写 BootRequest。
+# 少任何一个，这个 zip 就只能「改 rootfs 里的 /etc」，建不了分区也切不了系统。
+MODULE_RUNTIME_FILES = (
+    "payload/app.bin",
+    "bin/piano-boot-repack",
+    "bin/piano-boot-request",
+)
+
+
+def module_runtime_state(zip_path: Path) -> tuple[str, list[str]]:
+    """判断模块 zip 是「有运行时」还是「只有配置文本」。
+
+    不能只看文件存不存在：port 早期自造的配置包也是合法 zip（8 KB / 14 个文件），
+    状态被误标 READY 后照样通过发布门禁，刷进去才发现什么都做不了。
+    """
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            names = set(z.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return "BROKEN_ZIP", list(MODULE_RUNTIME_FILES)
+    missing = [n for n in MODULE_RUNTIME_FILES if n not in names]
+    return ("FULL" if not missing else "CONFIG_ONLY"), missing
 
 
 def sha256(path: Path) -> str:
@@ -159,11 +184,25 @@ def main() -> int:
     module_dir = out / "SunUEFI-Module"
     module_dir.mkdir(parents=True, exist_ok=True)
     module_files: dict[str, Path] = {}
-    if a.module_zip and a.module_zip.is_file():
+    runtime, missing = "NONE", []
+    has_module = bool(a.module_zip and a.module_zip.is_file())
+    if has_module:
         target_zip = module_dir / f"SunUEFI-Piano-{a.version}.zip"
         target_zip.write_bytes(a.module_zip.read_bytes())
         module_files[target_zip.name] = target_zip
-        module_status = "READY"
+        # 状态不能只看「文件存在」：8 KB 的配置包也是合法 zip，但里面没有
+        # payload/app.bin 与 piano-boot-repack，装上去建不了分区也切不了系统。
+        runtime, missing = module_runtime_state(target_zip)
+        module_status = "READY" if runtime == "FULL" else "PARTIAL_CONFIG_ONLY"
+        if missing:
+            readme = module_dir / "README-PARTIAL.txt"
+            readme.write_text(
+                "本模块只有配置文本，缺少运行时：" + ", ".join(missing) + "\n"
+                "它能在首次启动时把 /etc 的账号与挂载契约注入 sunuefi_root，\n"
+                "但**不能**创建分区、写 BootRequest 或切换系统。\n"
+                "完整运行时请用 Project-SunUEFI 的 SunUEFI-Module.tar.zst 作基座\n"
+                "（CI 通过 --module-base 传入，构建时自动合并）。\n")
+            module_files[readme.name] = readme
     else:
         readme = module_dir / "README.txt"
         readme.write_text(
@@ -177,6 +216,8 @@ def main() -> int:
     (module_dir / "SHA256SUMS").write_text(sums_for(module_files))
     artifacts["artifacts"]["SunUEFI-Module"] = {
         "status": module_status, "dir": module_dir.name,
+        "runtime": runtime,
+        "missing_runtime": missing,
         "files": {n: {"bytes": p.stat().st_size, "sha256": sha256(p)} for n, p in module_files.items()},
     }
 

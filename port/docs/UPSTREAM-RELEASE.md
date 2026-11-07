@@ -61,12 +61,17 @@ Initial Setup 首次开机建用户；`fstab` 也是 `PARTLABEL=linux_rootfs` / 
 而需求要预置 `piano/piano`、`root=piano`、挂 `sunuefi_root`。
 
 在 CI 里改 60 GiB 的 sparse 镜像需要 `simg2img` + 挂载 + `img2simg`，磁盘与时间代价极高。
-因此把 `port-inject-login.py` / `port-adapt-rootfs.py` 生成的配置**打进 Module ZIP 的 `payload/etc/`**，
-由 `service.sh` 在 Android 侧首次启动时挂载 `sunuefi_root` 注入（幂等，带 `.sunuefi-firstboot-done` 标记）。
-效果相同，且不触碰上游镜像本体。
+因此把 `port-inject-login.py` / `port-adapt-rootfs.py` 生成的配置合并进模块基座的
+`payload/etc/`（其余配置）与 `payload/account/`（passwd/group/shadow），由
+`piano-port-config.sh` 在 Android 侧首次启动时挂载 `sunuefi_root` 注入——**按用户名合并**，
+同名替换、缺失追加，保留 rootfs 自带的 root/daemon/nobody 等系统账号；幂等，带
+`.sunuefi-firstboot-done` 标记。效果相同，且不触碰上游镜像本体。
 
-内核命令行由 ESP 的 `config` 提供 `root=PARTUUID=<sunuefi_root>` 与 `piano.root=...`，
-因此首次启动前根分区就能挂上（见 `PORTING-MAP.md` 的 G1）。
+内核命令行由 **UEFI 固件**提供（编译进固件，不是 ESP 里那个 `config` 文件）：
+`rdinit=/pianoinit piano.root=LABEL=PIANOROOT ...`。`/pianoinit` 把 `piano.root=` 翻译成
+`PARTLABEL=sunuefi_root` 再 `exec /init`，因此首次启动前根分区就能挂上（见
+`PORTING-MAP.md` 的 G1）。上游镜像的卷标是 `linux_rootfs`，与本机 `PIANOROOT` 不同，
+这一层翻译是必须的。
 
 ## 本地复现（不依赖 GitHub）
 
