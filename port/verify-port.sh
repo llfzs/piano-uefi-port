@@ -36,7 +36,9 @@ for f in \
   tools/port-stage-esp.py tools/port-adapt-rootfs.py tools/port-partition-plan.py \
   tools/port-inject-login.py tools/port-package-artifacts.py tools/port-release-assets.py \
   tools/port-check-isolation.py tools/port-sync-upstream.sh tools/port-switch.sh \
-  tools/port-upstream-release.py \
+  tools/port-upstream-release.py tools/port-native-esp.py \
+  tools/native/pianoinit.sh tools/native/piano-root-fixup.sh \
+  tools/native/make-esp-image.py tools/native/deploy-esp.sh tools/native/rollback-esp.sh \
   build/port-build.sh build/port-full-build.sh build/port-from-upstream-release.sh \
   docs/PORTING-MAP.md docs/REQUIREMENTS.md docs/SYNC-UPSTREAM.md docs/RELEASE.md \
   docs/UPSTREAM-RELEASE.md; do
@@ -58,7 +60,7 @@ for p in files:
     ast.parse(p.read_text(), filename=str(p))
 print(f"  parsed {len(files)} python files")
 PY
-bash -n "$PORTROOT"/tools/*.sh "$PORTROOT"/build/*.sh 2>/dev/null || fail "shell 语法错误"
+bash -n "$PORTROOT"/tools/*.sh "$PORTROOT"/tools/native/*.sh "$PORTROOT"/build/*.sh 2>/dev/null || fail "shell 语法错误"
 if [ -n "$KIT" ]; then
   bash -n "$KIT"/apply-port.sh "$KIT"/verify-port.sh || fail "顶层 shell 语法错误"
 fi

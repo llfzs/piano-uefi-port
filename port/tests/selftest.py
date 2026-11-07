@@ -13,7 +13,8 @@
   - port-check-isolation.py：正例通过、上游改动触及命名空间负例被拦截  [需求3]
   - port-full-build.sh --dry-run：上游元数据/内核 commit/fragments/输出契约  [真实编译接线]
   - port-upstream-release.py adapt：上游 Release 成品 -> UEFI 输入（解 Android Boot Image、
-    SUNUEFI-LINUXv2 ESP、真实 Module ZIP、port-inputs.env 契约）[需求 3 上游活水]
+    从 vendor_boot 抽真 initramfs、本机固件四件套 ESP、真实 Module ZIP、port-inputs.env
+    契约）[需求 3 上游活水]
 
 参数：仓库根（扁平布局含 port/... 与 .github/workflows/...；也兼容旧工程包 overlay/ 布局）。
 """
@@ -31,6 +32,30 @@ RAW, FILL = 0xCAC1, 0xCAC2
 
 def sha(b: bytes) -> bytes:
     return hashlib.sha256(b).digest()
+
+
+def cpio_newc(files) -> bytes:
+    """最小 newc cpio 归档，files 为 (name, data, mode) 列表。
+
+    selftest 用它伪造上游 initramfs：port-native-esp.py 必须能在 /init 之上做 shim，
+    所以输入得是能被 cpio 解析的真实归档，不能是随便一段字节。
+    """
+    def header(ino, mode, size, namesize):
+        fields = (ino, mode, 0, 0, 1, 0, size, 0, 0, 0, 0, namesize, 0)
+        return b"070701" + b"".join(b"%08x" % f for f in fields)
+
+    out = bytearray()
+    ino = 1
+    for name, data, mode in files:
+        nb = name.encode() + b"\0"
+        hdr = header(ino, mode, len(data), len(nb)) + nb
+        out += hdr + b"\0" * ((4 - len(hdr) % 4) % 4)
+        out += data + b"\0" * ((4 - len(data) % 4) % 4)
+        ino += 1
+    nb = b"TRAILER!!!\0"
+    hdr = header(0, 0, 0, len(nb)) + nb
+    out += hdr + b"\0" * ((4 - len(hdr) % 4) % 4)
+    return bytes(out)
 
 
 def locate(kit: Path):
@@ -317,7 +342,7 @@ def main() -> int:
         run(tools / "port-release-assets.py", "--artifacts", split_arts,
             "--out", split_out, "--tag", "v0.0.0-split",
             "--policy", portroot / "config" / "release-policy.json",
-            "--max-asset-bytes", "1000", "--json")
+            "--max-asset-bytes", "1000", "--no-compress", "--json")
         sm = json.loads((split_out / "manifest.json").read_text())
         parted = {n: r for n, r in sm["artifacts"].items() if r["parted"]}
         assert len(parted) == 2, f"应有两个产物走分卷: {list(parted)}"
@@ -332,7 +357,32 @@ def main() -> int:
         upl = (split_out / "upload-files.txt").read_text().splitlines()
         assert all(n in sums for n in upl
                    if n not in ("SHA256SUMS", "RELEASE-NOTES.md")), "SHA256 未覆盖分卷"
-        print("  [release-assets-split] 超上限自动分卷 + cat 还原 + SHA256 覆盖 OK")
+        print("  [release-assets-split] 超上限裸切分卷 + cat 还原 + SHA256 覆盖 OK")
+
+        # ---- 6c. 大镜像 zstd 压缩（有 zstd 才测；缺工具时应自动退回裸切）----
+        import shutil as _sh
+        has_zstd = bool(_sh.which("zstd"))
+        if not has_zstd:
+            try:
+                import zstandard  # noqa: F401
+                has_zstd = True
+            except ImportError:
+                pass
+        if has_zstd:
+            z_out = d / "zstd_release"
+            run(tools / "port-release-assets.py", "--artifacts", split_arts,
+                "--out", z_out, "--tag", "v0.0.0-zstd",
+                "--policy", portroot / "config" / "release-policy.json",
+                "--max-asset-bytes", "3000", "--json")
+            zparts = sorted(z_out.glob("*.sparse.img.zst*"))
+            assert zparts, "未生成 .zst 资产"
+            assert any(p.name.endswith(".zst") for p in zparts) or \
+                   any(".zst.part" in p.name for p in zparts)
+            notes = (z_out / "RELEASE-NOTES.md").read_text()
+            assert "zstd -d" in notes, "还原命令必须是 zstd -d"
+            print("  [release-assets-zstd] 大镜像 zstd 压缩再分卷 + 还原命令 OK")
+        else:
+            print("  [release-assets-zstd] 跳过（环境无 zstd，脚本会退回裸切）")
 
         # ---- 7. port 层自包含校验（独立仓库模型，正例 + 两个负例）----
         iso_script = tools / "port-check-isolation.py"
@@ -387,18 +437,24 @@ def main() -> int:
         fb_inputs = d / "fb_inputs"
         fb_inputs.mkdir()
         fb_script = portroot / "build" / "port-full-build.sh"
-        r4 = subprocess.run(["bash", str(fb_script), "--fork", str(fb_fork),
-                             "--inputs", str(fb_inputs), "--dry-run"],
-                            capture_output=True, text=True)
-        assert r4.returncode == 0, f"port-full-build.sh --dry-run 失败: {r4.stderr}"
-        assert "config fragments = 2" in r4.stdout
-        plan = json.loads((fb_inputs / "kernel-plan.json").read_text())
-        assert plan["kernel_release"] == "7.2.14-piano56"
-        assert plan["commit"] == "bf42598aceec58fd7392314de233e5fab3835938"
-        fb_env = (fb_inputs / "port-inputs.env").read_text()
-        assert "FULL_BUILD_STATUS=DRY_RUN" in fb_env
-        assert "ESP_IMAGE=" in fb_env and "ROOT_IMAGE=" in fb_env
-        print("  [full-build] --dry-run 元数据/源码契约/输出契约 OK")
+        if sys.platform == "win32":
+            # MSYS/Git Bash 的 pwd 返回 /tmp/... 形式，脚本把该字符串直接嵌进
+            # `python3 -c`，Windows 原生 python 解析不了这个路径。CI 是 Linux，
+            # 这条用例在 CI 上照常执行；本地 Windows 只跳过。
+            print("  [full-build] 跳过（Windows+MSYS 的 /tmp 路径无法传给原生 python）")
+        else:
+            r4 = subprocess.run(["bash", str(fb_script), "--fork", str(fb_fork),
+                                 "--inputs", str(fb_inputs), "--dry-run"],
+                                capture_output=True, text=True)
+            assert r4.returncode == 0, f"port-full-build.sh --dry-run 失败: {r4.stderr}"
+            assert "config fragments = 2" in r4.stdout
+            plan = json.loads((fb_inputs / "kernel-plan.json").read_text())
+            assert plan["kernel_release"] == "7.2.14-piano56"
+            assert plan["commit"] == "bf42598aceec58fd7392314de233e5fab3835938"
+            fb_env = (fb_inputs / "port-inputs.env").read_text()
+            assert "FULL_BUILD_STATUS=DRY_RUN" in fb_env
+            assert "ESP_IMAGE=" in fb_env and "ROOT_IMAGE=" in fb_env
+            print("  [full-build] --dry-run 元数据/源码契约/输出契约 OK")
 
         # ---- 9. 上游 Release 适配器（默认构建路径，纯 Python 离线覆盖）----
         # 不依赖 zstd/mtools：只验证 adapt 的解包/ESP/Module/契约逻辑。
@@ -416,9 +472,20 @@ def main() -> int:
             ur_inputs.mkdir()
             tag = "v1.0.0-selftest"
             # 合成上游 boot.zip（Android Boot Image v2 + 完整合并 DTB）
+            import os
             kernel = bytearray(128 * 1024)
             kernel[:40] = b"Linux version 7.2.14-piano56 selftest\x00"[:40]
-            ramdisk = gzip.compress(b"070701" + b"selftest initramfs" * 64, mtime=0)
+            kernel[0:2] = b"MZ"          # port-native-esp.py 要求 EFI Stub PE 头
+            # 真实 newc cpio（含 /init）：port-native-esp.py 要在 /init 之上挂 shim，
+            # 且注入后重新打包，所以必须是可解析的归档而不是任意字节。
+            ramdisk_raw = cpio_newc([
+                ("init", b"#!/bin/sh\nexec /bin/sh\n", 0o100755),
+                ("etc", b"", 0o040755),
+                ("etc/hostname", b"piano\n", 0o100644),
+                ("big", os.urandom(20000), 0o100644),
+            ])
+            ramdisk = gzip.compress(ramdisk_raw, mtime=0)
+            assert len(ramdisk) >= 4096, "合成 ramdisk 太小，会被判为空包"
             page, hsize = 4096, 1660
             bh = bytearray(hsize)
             bh[0:8] = b"ANDROID!"
@@ -463,8 +530,18 @@ def main() -> int:
                  "_", str(ur_inputs / "port-inputs.env")],
                 capture_output=True, text=True)
             assert chk.returncode == 0, f"port-inputs.env 无法 source: {chk.stderr}"
-            esp_manifest = json.loads((ur_inputs / "esp-tree/port-esp-manifest.json").read_text())
-            assert esp_manifest["payload"]["magic"] == "SUNUEFI-LINUXv2"
+            esp_manifest = json.loads(
+                (ur_inputs / "esp-tree/native-esp-manifest.json").read_text())
+            assert esp_manifest["layout"] == "native-stable-quad"
+            stable = ur_inputs / "esp-tree/EFI/Piano/stable"
+            assert (stable / "Image").read_bytes() == bytes(kernel)
+            assert (stable / "board.dtb").read_bytes() == bytes(dtb)
+            # boot.img 必须是 Android boot v2（本机固件按头长度定位 kernel/ramdisk），
+            # 不能是 SUNUEFI-LINUXv2 那套自定义 144B 头。
+            boot_bytes = (stable / "boot.img").read_bytes()
+            assert boot_bytes[:8] == b"ANDROID!"
+            assert struct.unpack_from("<I", boot_bytes, 40)[0] == 2
+            assert struct.unpack_from("<I", boot_bytes, 1644)[0] == 1660
             modzip = ur_inputs / f"SunUEFI-Piano-{tag}.zip"
             assert modzip.is_file()
             with zipfile.ZipFile(modzip) as z:

@@ -13,9 +13,10 @@
   resolve  —— 查 GitHub API 拿到最新 Release 的资产清单，输出 downloads.tsv 与
               upstream-release.json（tag / commit / 每个资产的 sha256）。不写死 tag。
   adapt    —— 解 boot.zip 里的 A 槽三元组，抽出裸 Image / initramfs / 合并 DTB，
-              交给 port-stage-esp.py 生成 SUNUEFI-LINUXv2 ESP；生成含 piano/piano
-              账号与 sunuefi_root 挂载契约的 Module ZIP；输出 port-inputs.env。
-              上游 root.sparse.img 是 Android sparse 格式，原样透传给打包器。
+              交给 port-native-esp.py 生成本机固件读取的四件套 ESP
+              （Image / board.dtb / initramfs / boot.img，boot.img 为 Android boot v2）；
+              生成含 piano/piano 账号与 sunuefi_root 挂载契约的 Module ZIP；输出
+              port-inputs.env。上游 root.sparse.img 是 Android sparse，原样透传给打包器。
 
 不联网之外的副作用、不改上游文件、不碰设备、不执行 fastboot。
 """
@@ -133,6 +134,37 @@ def cmd_resolve(a) -> int:
 # ------------------------------------------------------- android boot image
 def align(n: int, page: int) -> int:
     return (n + page - 1) // page * page
+
+
+def unpack_vendor_boot(data: bytes) -> dict:
+    """解析 vendor_boot v3/v4，返回 vendor_ramdisk。
+
+    布局（v3/v4 一致的部分）：`[header][vendor_ramdisk][dtb]`，v4 只是在这之后**追加**
+    `vendor_ramdisk_table` 与 `bootconfig`，ramdisk 的起始位置仍是页对齐后的 header 末尾。
+
+    实测上游 v1.0.0：header_size=2128、page=4096、vendor_ramdisk_size=51673969，
+    ramdisk 从 4096 开始、以 zstd magic 开头（不是 gzip）。
+
+    为什么必须专门解析：上游 boot.img 的 ramdisk 为 0，init_boot.img 的 ramdisk 只有
+    48 B（gzip 空包）。真实 ramdisk 只在 vendor_boot 里，而 v0..v2 的 boot 解析顺序
+    （kernel/ramdisk/second/dtb 依次页对齐）对 VNDRBOOT 完全不适用；按 grep 找 gzip
+    magic 也找不到——它是 zstd。
+    """
+    if data[:8] != b"VNDRBOOT":
+        raise ValueError("不是 Android vendor_boot（缺 VNDRBOOT magic）")
+    u32 = lambda o: struct.unpack_from("<I", data, o)[0]
+    hv = u32(8)
+    page = u32(12)
+    if page not in (2048, 4096, 8192, 16384, 32768, 65536, 131072):
+        page = 4096
+    ramdisk_size = u32(24)
+    header_size = u32(2096) if len(data) >= 2100 and 0 < u32(2096) < 16384 else 2112
+    off = align(header_size, page)
+    if ramdisk_size <= 0 or off + ramdisk_size > len(data):
+        raise ValueError(f"vendor_boot ramdisk 段越界（off={off} size={ramdisk_size} "
+                         f"file={len(data)}）")
+    return {"header_version": hv, "page": page,
+            "ramdisk": data[off:off + ramdisk_size]}
 
 
 def unpack_boot_image(data: bytes) -> dict:
@@ -352,31 +384,32 @@ def cmd_adapt(a) -> int:
         raise SystemExit(f"抽出的内核过小({len(kernel)}B, 格式{kfmt})，疑似不是裸 ARM64 Image")
     (inputs / "Image").write_bytes(kernel)
 
+    # ramdisk 选取顺序：boot.img → init_boot.img → vendor_boot.img，取「第一个像样的」。
+    # 上游 v1.0.0 实测：boot.img 的 ramdisk 为 0；init_boot.img 的 ramdisk 只有 48 B
+    # （gzip 空包）；真 ramdisk 在 vendor_boot.img（zstd，约 49 MiB）。
+    # 旧逻辑把 48 B 当成有效值直接采用，于是 CI 产物里的 initramfs 是个空包——
+    # 能刷进去但内核一定 panic，属于「静默产出不可用固件」，这里必须显式判空。
     ramdisk = parsed["ramdisk"]
-    if not ramdisk and init_boot:
+    ramdisk_source = used
+    if len(ramdisk) < 4096 and init_boot:
         try:
-            ramdisk = unpack_boot_image(init_boot)["ramdisk"]
-            used += " + init_boot.img"
-        except ValueError:
-            pass
-    if not ramdisk:
-        # v2 的 vendor_boot 兜底：从整个镜像里找 gzip cpio
-        for blob in (vendor_boot, b""):
-            p = blob.find(b"\x1f\x8b")
-            if p >= 0:
-                ramdisk = blob[p:]
-                used += " + vendor_boot(ramdisk)"
-                break
-    if not ramdisk:
-        raise SystemExit("未找到 initramfs（generic ramdisk），无法生成 SUNUEFI-LINUXv2 payload")
-    # 上游 v1.0.0 的 boot.zip 无独立 initramfs，A 槽三元组里抽出的 generic ramdisk
-    # 可能只有几十字节（空/占位）。不擅自把 vendor_boot fragment 拼成 initramfs，
-    # 而是显式告警并写进报告，避免把「能刷但起不来」伪装成已闭环（G1 契约）。
-    initramfs_suspect = len(ramdisk) < 4096
-    if initramfs_suspect:
-        log(f"!! 警告：抽出的 initramfs 仅 {len(ramdisk)}B，疑似空/占位 generic ramdisk")
-        log("   上游 boot.zip 无独立 initramfs；真实 ramdisk 可能在 vendor_boot fragment")
-        log("   或已编进内核。真机能否挂载 sunuefi_root 须按 PORTING-MAP.md 的 G1 验证")
+            r = unpack_boot_image(init_boot)["ramdisk"]
+            if len(r) > len(ramdisk):
+                ramdisk, ramdisk_source = r, "init_boot.img"
+        except ValueError as e:
+            log(f"  init_boot.img 不可解析: {e}")
+    if len(ramdisk) < 4096 and vendor_boot:
+        try:
+            r = unpack_vendor_boot(vendor_boot)["ramdisk"]
+            if len(r) > len(ramdisk):
+                ramdisk, ramdisk_source = r, "vendor_boot.img"
+        except ValueError as e:
+            log(f"  vendor_boot.img 不可解析: {e}")
+    if len(ramdisk) < 4096:
+        raise SystemExit(
+            f"未找到可用 initramfs：最佳候选仅 {len(ramdisk)}B（boot/init_boot/vendor_boot "
+            "都没给出真实 ramdisk）。上游 boot.zip 布局可能已变，拒绝产出起不来的固件。")
+    log(f"  ramdisk 来源 {ramdisk_source}: {len(ramdisk)}B")
     (inputs / "initramfs.cpio.gz").write_bytes(ramdisk)
 
     if not dtb:
@@ -386,18 +419,31 @@ def cmd_adapt(a) -> int:
     (inputs / "piano-boot.dtb").write_bytes(dtb)
     log(f"内核来源 {used}: Image {len(kernel)}B({kfmt}), initrd {len(ramdisk)}B, DTB {len(dtb)}B")
 
-    # 3) 生成 ESP 目录（SUNUEFI-LINUXv2 payload 由 port-stage-esp.py 完成）
+    # 3) 生成 ESP 目录：必须是本机固件真正读取的四件套
+    #    （\EFI\Piano\stable\{Image,board.dtb,initramfs,boot.img}），
+    #    boot.img 为 Android boot v2 容器；不能再用 port-stage-esp.py 的
+    #    SUNUEFI-LINUXv2/Image.efi 那套命名——两套契约混用会直接开不了机。
     esp_dir = inputs / "esp-tree"
     if esp_dir.exists():
         import shutil
         shutil.rmtree(esp_dir)
-    subprocess.run([sys.executable, str(fork / "port/tools/port-stage-esp.py"),
-                    "--image", str(inputs / "Image"),
-                    "--dtb", str(inputs / "piano-boot.dtb"),
-                    "--initrd", str(inputs / "initramfs.cpio.gz"),
-                    "--profile", str(profile),
-                    "--output", str(esp_dir), "--force"],
-                   check=True, capture_output=True, text=True)
+    native = fork / "port/tools/native"
+    for need in ("pianoinit.sh", "piano-root-fixup.sh"):
+        if not (native / need).is_file():
+            raise SystemExit(f"缺 native 注入脚本: port/tools/native/{need}")
+    r = subprocess.run([sys.executable, str(fork / "port/tools/port-native-esp.py"),
+                        "--kernel", str(inputs / "Image"),
+                        "--dtb", str(inputs / "piano-boot.dtb"),
+                        "--ramdisk", str(inputs / "initramfs.cpio.gz"),
+                        "--init", str(native / "pianoinit.sh"),
+                        "--fixup-script", str(native / "piano-root-fixup.sh"),
+                        "--compress", "gzip",
+                        "--output", str(esp_dir), "--force"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit("port-native-esp.py 失败:\n" + (r.stderr or r.stdout))
+    for msg in (r.stderr or "").strip().splitlines():
+        log("  " + msg)
 
     # 4) Module ZIP（真实内容：账号 + fstab + root-policy + 分区计划 + 切换）
     module_zip = inputs / f"SunUEFI-Piano-{tag}.zip"
@@ -433,9 +479,6 @@ def cmd_adapt(a) -> int:
     note = ("root 镜像为上游 root.sparse.img 原样透传；piano/piano 账号与 "
             "sunuefi_root 挂载契约由 Module ZIP 的 service.sh 首次启动时注入。"
             "真机引导需验证 G1 挂载 / G2 EFI Stub / G3 OS4.0.5 BOOT 头兼容。")
-    if initramfs_suspect:
-        note += ("【G1 高风险】initramfs 仅 %dB，疑似空 ramdisk，"
-                 "刷入后可能无法挂载 sunuefi_root。" % len(ramdisk))
 
     report = {
         "status": env["FULL_BUILD_STATUS"],
@@ -445,7 +488,8 @@ def cmd_adapt(a) -> int:
         "kernel_format": kfmt,
         "kernel_bytes": len(kernel),
         "initramfs_bytes": len(ramdisk),
-        "initramfs_suspicious": initramfs_suspect,
+        "initramfs_source": ramdisk_source,
+        "initramfs_suspicious": False,   # <4096B 已在上游直接 SystemExit，走到这里必为真 ramdisk
         "dtb_bytes": len(dtb),
         "esp_dir": str(esp_dir),
         "module": minfo,

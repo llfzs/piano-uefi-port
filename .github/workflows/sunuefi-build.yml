@@ -318,10 +318,16 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 释放 runner 磁盘（root sparse 约 8GiB，分卷发布需额外空间）
+      - name: 释放 runner 磁盘（root sparse 约 8GiB，压缩后另需约 4GiB）
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android 2>/dev/null || true
           df -h .
+
+      - name: 安装 zstd（大镜像压成 .zst 再分卷，与上游同形态）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+          zstd --version
 
       - name: 下载本次构建的 SunUEFI-* 产物
         uses: actions/download-artifact@v4
@@ -439,4 +445,4 @@ jobs:
           echo "- 链接: https://github.com/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
           echo "- 触发: \`${{ github.event_name }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- 发布门禁: \`$GUARD_STATUS\`（草稿=$DRAFT）" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 资产: SunUEFI-Module.zip / SunUEFI-ESP.zip / SunUEFI-Root-*.zip / manifest.json / SHA256SUMS / RELEASE-NOTES.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 资产: SunUEFI-Module.zip / SunUEFI-ESP.zip / SunUEFI-Root-*.sparse.img.zst[.partN] / manifest.json / SHA256SUMS / RELEASE-NOTES.md" >> "$GITHUB_STEP_SUMMARY"

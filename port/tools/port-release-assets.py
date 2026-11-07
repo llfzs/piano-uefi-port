@@ -10,7 +10,8 @@ Release 的同名 asset 会互相覆盖。因此本脚本把**每个产物目录
   release-assets/
     SunUEFI-Module.zip            内含原目录全部文件（含其自身 SHA256SUMS）
     SunUEFI-ESP.zip
-    SunUEFI-Root-<target>--*.part0..N   大镜像超过上限时按字节分卷（不打单个超大 ZIP）
+    SunUEFI-Root-<target>--*.img.zst       大镜像先 zstd 压缩，压后仍超上限才分卷
+    SunUEFI-Root-<target>--*.img.zst.part0..N
     manifest.json                 汇总清单（每个资产的 sha256、源文件、状态、构建元数据）
     SHA256SUMS                    全局校验和（针对所有发布资产 + manifest.json）
     RELEASE-NOTES.md              人类可读发布说明（含校验和、还原命令、上游基线、安全提示）
@@ -20,9 +21,13 @@ Release 的同名 asset 会互相覆盖。因此本脚本把**每个产物目录
 设计约束：
   * 小产物 ZIP 用 STORED 模式 + 固定时间戳，避免数 GB 镜像压缩耗时，且产物可复现；
     流式写入，不把整个镜像读进内存。
-  * GitHub Release 单资产上限 2 GiB：目录内任一文件 > 1,900,000,000 B（与上游
-    assets-manifest.json 的 part_bytes 一致）时，改为字节分卷 .partN + 小文件平铺，
-    RELEASE-NOTES.md 给出 `cat *.part* > 原文件名` 还原命令；--max-asset-bytes 可调阈值。
+  * GitHub Release 单资产上限 2 GiB：目录内任一文件 > 1,900,000,000 B 时，
+    先按 zstd 压缩为 `<原名>.zst`（与上游 `*-rootfs.img.zst.part*` 同一形态），
+    压后仍超上限才按字节切成 `.zst.partN`，RELEASE-NOTES.md 给出
+    `cat *.zst.part* | zstd -d > 原文件名` 还原命令；--max-asset-bytes 可调阈值，
+    --zstd-level / --no-compress 可调压缩级别或关闭压缩（自检用）。
+    这一步是刚需：8.5 GiB 的 sparse root 不压缩要切 5 卷、下载 8.5 GiB；
+    zstd 后约 3.4 GiB、2 卷，与上游一致。
   * 严格校验 Module / ESP / 至少一个 Root 齐全（--allow-partial 仅供离线自检）。
   * 发布门禁：检测到占位产物时输出 release-flags.env（FORCE_DRAFT/FORCE_PRERELEASE），
     由 publish job source 后强制降级为草稿+预发布，避免骨架被当成正式版。
@@ -34,6 +39,7 @@ import hashlib
 import json
 import shlex
 import shutil
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -90,8 +96,45 @@ def make_zip(src: Path, dst: Path) -> list[str]:
 
 
 # GitHub Release 单资产上限 2 GiB；与上游 assets-manifest.json 的 part_bytes 对齐。
-# 超过则按字节切分为 .partN（不压缩，避免数 GB 镜像的压缩耗时与额外内存）。
+# 大文件不再裸切：先 zstd 压缩（上限从 8.5 GiB 降到 ~3.4 GiB），压后仍超才分卷。
 MAX_ASSET_BYTES = 1_900_000_000
+
+
+def zstd_available() -> bool:
+    if shutil.which("zstd"):
+        return True
+    try:
+        import zstandard  # type: ignore  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def compress_zstd(src: Path, dst: Path, level: int = 19) -> None:
+    """流式 zstd 压缩。优先用 CLI（多线程、不占 Python 内存），退回 python zstandard。
+
+    `--long=27` 把窗口开到 zstd 默认解压上限 27（128 MiB），对 8 GiB 级稀疏镜像
+    能多挤出约 5%，且普通 `zstd -d` 即可解，不需要用户额外加 --long。
+
+    没有 zstd 时抛 RuntimeError，由调用方退回裸切分卷——发布失败比产物变大更糟。
+    """
+    if shutil.which("zstd"):
+        cmd = ["zstd", f"-{level}", "--long=27", "-T0", "-q", "-f",
+               "-o", str(dst), str(src)]
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            raise RuntimeError(f"zstd 压缩失败({r.returncode}): {src}")
+        return
+    try:
+        import zstandard  # type: ignore
+    except ImportError:
+        raise RuntimeError("环境无 zstd（CLI 与 python 模块皆缺）")
+    params = zstandard.ZstdCompressionParameters.from_level(
+        level, window_log=27, threads=-1)
+    c = zstandard.ZstdCompressor(compression_params=params)
+    with src.open("rb") as fi, dst.open("wb") as fo:
+        with c.stream_writer(fo, closefd=False) as w:
+            shutil.copyfileobj(fi, w, 8 * 1024 * 1024)
 
 
 def split_large_file(src: Path, dst_stem: Path, limit: int = MAX_ASSET_BYTES):
@@ -123,9 +166,11 @@ def split_large_file(src: Path, dst_stem: Path, limit: int = MAX_ASSET_BYTES):
     return parts, h.hexdigest(), total
 
 
-def make_parted_assets(d: Path, out: Path, limit: int = MAX_ASSET_BYTES):
-    """超大产物：不生成单个 ZIP（会超 2 GiB 上限），直接把目录内文件平铺/切分。
+def make_parted_assets(d: Path, out: Path, limit: int = MAX_ASSET_BYTES,
+                       level: int = 19, compress: bool = True):
+    """超大产物：不生成单个 ZIP（会超 2 GiB 上限），直接压缩/切分 + 小文件平铺。
 
+    大文件的处置顺序与上游一致：zstd 压缩 → 压后仍超限才切 .partN。
     返回 (asset_paths, asset_rows, inner_names, restore_text)。
     limit 可由 --max-asset-bytes 调小，便于离线自检覆盖分卷路径。
     """
@@ -135,14 +180,41 @@ def make_parted_assets(d: Path, out: Path, limit: int = MAX_ASSET_BYTES):
     restore: list[str] = []
     for p in files:
         rel = p.relative_to(d).as_posix()
+        name_in_release = Path(rel).name
         stem = out / f"{d.name}--{rel.replace('/', '_')}"
+        if p.stat().st_size > limit and compress:
+            packed = stem.with_name(stem.name + ".zst")
+            print(f"  zstd -{level}: {rel} {human(p.stat().st_size)} ... ", end="",
+                  file=sys.stderr, flush=True)
+            try:
+                compress_zstd(p, packed, level)
+            except RuntimeError as e:
+                print(f"跳过压缩（{e}），改为裸切", file=sys.stderr)
+                packed = None
+            if packed is not None:
+                print(f"-> {human(packed.stat().st_size)}", file=sys.stderr)
+                if packed.stat().st_size > limit:
+                    parts, digest, _ = split_large_file(packed, packed, limit)
+                    packed.unlink(missing_ok=True)
+                    for q in parts:
+                        assets.append(q)
+                        rows.append({"name": q.name, "bytes": q.stat().st_size,
+                                     "sha256": sha256(q)})
+                    restore.append(f"cat {packed.name}.part* | zstd -d > {name_in_release}"
+                                   f"   # 还原后 sha256={digest}")
+                else:
+                    assets.append(packed)
+                    rows.append({"name": packed.name, "bytes": packed.stat().st_size,
+                                 "sha256": sha256(packed)})
+                    restore.append(f"zstd -d {packed.name} -o {name_in_release}")
+                continue
         if p.stat().st_size > limit:
             parts, digest, _ = split_large_file(p, stem, limit)
             for q in parts:
                 assets.append(q)
                 rows.append({"name": q.name, "bytes": q.stat().st_size,
                              "sha256": sha256(q)})
-            restore.append(f"cat {stem.name}.part* > {Path(rel).name}"
+            restore.append(f"cat {stem.name}.part* > {name_in_release}"
                            f"   # 还原后 sha256={digest}")
         else:
             shutil.copyfile(p, stem)
@@ -192,7 +264,8 @@ def build_notes(meta: dict, artifacts: dict, policy: dict, sums_text: str) -> st
         "## 产物",
         "",
         "小体积产物压成同名 ZIP（内含目录级 `SHA256SUMS`）；超过 Release 单文件 2 GiB "
-        "上限的大镜像改为字节分卷 `.part*`，按下方命令还原。",
+        "上限的大镜像改用 **zstd 压缩**（与上游 `*-rootfs.img.zst.part*` 同形态），"
+        "压后仍超限才切成 `.part*`，按下方命令还原。",
         "",
         "| 文件 | 大小 | SHA256 | 状态 |",
         "|---|---|---|---|",
@@ -215,9 +288,9 @@ def build_notes(meta: dict, artifacts: dict, policy: dict, sums_text: str) -> st
         lines += [
             "## 还原分卷镜像",
             "",
-            "大镜像按 1,900,000,000 字节切分（与上游 `assets-manifest.json` 的 "
-            "`part_bytes` 一致，且低于 GitHub Release 单资产 2 GiB 上限）。",
-            "下载同一组 `.part*` 全部文件后，在空目录执行：",
+            "大镜像先用 zstd 压缩（与上游同一形态），压后超过 GitHub Release 单资产 "
+            "2 GiB 上限的再按 1,900,000,000 字节切卷。",
+            "下载同一组 `.zst*` 全部文件后，在空目录执行（`zstd` 需 1.4+）：",
             "",
             "```bash",
         ]
@@ -269,7 +342,11 @@ def main() -> int:
     ap.add_argument("--upstream-baseline", default="", help="上游同步基线描述（可选）")
     ap.add_argument("--allow-partial", action="store_true", help="放宽必需产物校验（仅自检用）")
     ap.add_argument("--max-asset-bytes", type=int, default=MAX_ASSET_BYTES,
-                    help="单个 Release 资产字节上限，超过则分卷（默认 1900000000）")
+                    help="单个 Release 资产字节上限，超过则压缩/分卷（默认 1900000000）")
+    ap.add_argument("--zstd-level", type=int, default=19,
+                    help="大镜像 zstd 压缩级别（默认 19；CI 上 8.5GiB 约数分钟）")
+    ap.add_argument("--no-compress", action="store_true",
+                    help="关闭 zstd 压缩，超限直接裸切（仅自检/回退用）")
     ap.add_argument("--force", action="store_true", help="输出目录非空时仍覆盖")
     ap.add_argument("--json", action="store_true", help="stdout 只输出 JSON 摘要")
     a = ap.parse_args()
@@ -309,8 +386,9 @@ def main() -> int:
         files = collect_files(d)
         oversized = any(p.stat().st_size > limit for p in files)
         if oversized:
-            # 单个 ZIP 会超过 Release 单资产上限：改为字节分卷 + 平铺小文件
-            _assets, rows, inner, restore = make_parted_assets(d, out, limit)
+            # 单个 ZIP 会超过 Release 单资产上限：先 zstd 压缩，压后仍超限才切分
+            _assets, rows, inner, restore = make_parted_assets(
+                d, out, limit, a.zstd_level, not a.no_compress)
             artifacts[d.name] = {
                 "zip": f"{d.name}.zip",   # 逻辑产物名（兼容说明/manifest），实际按 assets 上传
                 "assets": [r["name"] for r in rows],
@@ -318,6 +396,7 @@ def main() -> int:
                 "bytes": sum(r["bytes"] for r in rows),
                 "sha256": "",             # 分卷后无单一文件；各 part 校验和见 asset_rows
                 "parted": True,
+                "compressed": not a.no_compress,
                 "restore": restore,
                 "source_dir": d.name,
                 "files": inner,

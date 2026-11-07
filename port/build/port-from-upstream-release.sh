@@ -13,9 +13,10 @@
 #   2. download : 按 role 下载 *-boot.zip / *-tools.zip / *-rootfs.img.zst.part*
 #                 + SHA256SUMS.assets / assets-manifest.json，逐个 sha256 校验
 #   3. rootfs   : cat part* | zstd -d > root.sparse.img（已是 android sparse，原样透传）
-#   4. adapt    : 解 boot 三元组 -> Image/initramfs/DTB -> SUNUEFI-LINUXv2 ESP
+#   4. adapt    : 解 boot 三元组 -> Image/initramfs/DTB -> 本机固件四件套 ESP
+#                 （Image / board.dtb / initramfs / boot.img，boot.img = Android boot v2）
 #                 -> 生成含 piano/piano 与 sunuefi_root 契约的真实 Module ZIP
-#   5. esp.raw  : mkfs.vfat + mcopy 把 ESP 目录打成 FAT32 镜像
+#   5. esp.raw  : mkfs.vfat -S 4096（对齐原厂 4 KiB 扇区）+ mcopy 打成 FAT32 镜像
 #   6. 输出 port-inputs.env（与 workflow 契约一致）+ upstream-release.json / upstream-adapt.json
 #
 # 用法：
@@ -189,7 +190,10 @@ for t in truncate mkfs.vfat mcopy; do
 done
 ESPIMG="$INPUTS/esp.raw"
 truncate -s "${ESP_SIZE_MIB}M" "$ESPIMG"
-mkfs.vfat -F 32 -n SUNUEFI_ESP "$ESPIMG" >/dev/null
+# 本机原厂 ESP 的几何是 4096 B/扇区、1 扇区/簇、保留 32 扇区、2 份 FAT
+# （实测 BPS=4096 SPC=1 RsvdSec=32 NumFAT=2）。mkfs.vfat 默认 512 B 扇区，
+# 而分区的逻辑扇区是 4 KiB，固件按设备扇区读 FAT 会整体错位——必须显式对齐。
+mkfs.vfat -F 32 -S 4096 -s 1 -R 32 -f 2 -n SUNUEFI_ESP "$ESPIMG" >/dev/null
 MTOOLS_SKIP_CHECK=1 mcopy -i "$ESPIMG" -s "$INPUTS/esp-tree/EFI" ::
 SZ=$(stat -c %s "$ESPIMG")
 [ $((SZ % 4096)) -eq 0 ] || die "ESP 镜像未 4K 对齐: $SZ"

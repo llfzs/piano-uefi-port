@@ -193,8 +193,9 @@ def main() -> int:
         readme = esp_dir / "README.txt"
         readme.write_text(
             "SunUEFI-ESP 占位。\n"
-            "真实产物 esp.sparse.img 来自 port/tools/port-stage-esp.py 生成的 ESP 目录，\n"
-            "经 mkfs.vfat 打成 FAT32 raw 镜像后，由本脚本编码为 Android sparse。\n"
+            "真实产物 esp.sparse.img 来自 port/tools/port-native-esp.py 生成的四件套 ESP 目录\n"
+            "（EFI/Piano/stable/{Image,board.dtb,initramfs,boot.img}），经 mkfs.vfat -S 4096\n"
+            "打成 FAT32 raw 镜像后，由本脚本编码为 Android sparse。\n"
             "CI 传入 --esp-image <esp.raw|.sparse.img> 即生成真实镜像。\n"
             "刷写目标分区：sunuefi_esp（绝不写 vbmeta/dtbo/_b/userdata）。\n")
         esp_files[readme.name] = readme
@@ -224,10 +225,12 @@ def main() -> int:
             readme = root_dir / "README.txt"
             readme.write_text(
                 f"{d['artifact']} 占位。\n"
-                f"真实产物 {d['root_image']} 来自 {d['source']}，\n"
-                "经 port-inject-login.py（piano/piano + root piano）与 "
-                "port-adapt-rootfs.py（fstab/root-policy）后处理后，\n"
-                "由本脚本编码为 Android sparse。CI 传入 --root-image 即生成真实镜像。\n"
+                f"真实产物 {d['root_image']} 来自 {d['source']}，由本脚本编码/透传为 "
+                "Android sparse。\n"
+                "默认 upstream-release 路径下镜像是原样透传：piano/piano 账号、fstab 与 "
+                "root-policy 由 Module ZIP 在首次启动时注入，不在此阶段改写镜像；\n"
+                "若走源码编译路径，则由 port-inject-login.py 与 port-adapt-rootfs.py 预处理。\n"
+                "CI 传入 --root-image 即生成真实镜像。\n"
                 "刷写目标分区：sunuefi_root（标签 PIANOROOT，ext4）。\n")
             root_files[readme.name] = readme
         (root_dir / "SHA256SUMS").write_text(sums_for(root_files))
