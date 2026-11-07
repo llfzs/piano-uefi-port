@@ -290,7 +290,8 @@ def build_notes(meta: dict, artifacts: dict, policy: dict, sums_text: str) -> st
             "",
             "大镜像先用 zstd 压缩（与上游同一形态），压后超过 GitHub Release 单资产 "
             "2 GiB 上限的再按 1,900,000,000 字节切卷。",
-            "下载同一组 `.zst*` 全部文件后，在空目录执行（`zstd` 需 1.4+）：",
+            "下载同一组 `.zst*` 全部文件后，在空目录执行（`zstd` 需 1.4+；"
+            "若报 `window too large` 则解压命令加 `--long=27`）：",
             "",
             "```bash",
         ]
