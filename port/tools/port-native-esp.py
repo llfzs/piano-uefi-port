@@ -5,7 +5,8 @@
 为什么不能复用 port-stage-esp.py
 --------------------------------
 本机固件（`\\EFI\\Piano\\stable\\`）读四个文件：Image / board.dtb / initramfs / boot.img，
-其中 boot.img 是 **Android boot v2** 容器（只装 kernel+ramdisk，dtb_size=0、cmdline 为空）。
+其中 boot.img 是 **Android boot v2** 容器：kernel + ramdisk + 内嵌 DTB（与 board.dtb 同内容），
+`header_size=1660`、`dtb_size`/`dtb_addr` 按原厂实测值写，cmdline 为空。
 port-stage-esp.py 产出的是 SUNUEFI-LINUXv2 单文件 payload + Image.efi 命名，属于另一套
 加载器契约；两者混用会直接开不了机。
 
@@ -37,10 +38,18 @@ from pathlib import Path
 PAGE = 4096
 MAGIC = b"ANDROID!"
 HEADER_VERSION = 2
-# 取自本机现有 boot.img，与其保持同一组装载地址。
+# 以下四个地址/长度取自本机原厂 boot.img 的实测值，不是猜的：
+#   header_size@1644 = 1660，recovery_dtbo_size@1632 = 0，
+#   dtb_size@1648(u32) = 1212784，dtb_addr@1652(u64) = 0x11F00000，
+#   且该 DTB 与 ESP 里的 board.dtb 逐字节相同（dtb 段跟在 ramdisk 之后、页对齐）。
+# 早期版本把 header_size 留成 0、只写 1632，属于两处错位：1632 是 recovery_dtbo_size，
+# v2 的 dtb_size 在 1648，而 header_size 缺失会让按头长度定位 kernel/ramdisk 的
+# bootloader 解析错位。这里按原厂布局原样复刻。
 KERNEL_ADDR = 0x10008000
 RAMDISK_ADDR = 0x11000000
 TAGS_ADDR = 0x10000100
+DTB_ADDR = 0x11F00000
+HEADER_SIZE = 1660
 
 
 # --------------------------------------------------------------- compression
@@ -113,7 +122,13 @@ def cpio_entries(raw: bytes):
                    name=name, data=data)
         off = (pos + filesize + 3) & ~3
         if name == "TRAILER!!!":
-            return
+            # 内核支持多段拼接的 cpio（微码常见的作法就是前面挂一段独立归档）。
+            # 遇到 TRAILER 不能直接收工，要跨过填充找下一段的魔数；否则后段文件
+            # 在重新打包时会整体丢掉（实测两段 4 条目只解析出 2 个）。
+            while off + 8 <= len(raw) and raw[off:off + 6] not in (b"070701", b"070702"):
+                if raw[off] != 0:      # 非零字节说明后面不是归档，正常结束
+                    return
+                off += 1
 
 
 def cpio_pack(entries) -> bytes:
@@ -183,7 +198,7 @@ def boot_id(kernel: bytes, ramdisk: bytes) -> bytes:
     return h.digest() + b"\0" * 12
 
 
-def build_boot_image(kernel: bytes, ramdisk: bytes) -> bytes:
+def build_boot_image(kernel: bytes, ramdisk: bytes, dtb: bytes = b"") -> bytes:
     hdr = bytearray(PAGE)
     hdr[0:8] = MAGIC
     struct.pack_into("<8I", hdr, 8, len(kernel), KERNEL_ADDR, len(ramdisk), RAMDISK_ADDR,
@@ -193,10 +208,18 @@ def build_boot_image(kernel: bytes, ramdisk: bytes) -> bytes:
     hdr[48:64] = b"\0" * 16
     hdr[64:576] = b"\0" * 512          # 固件自己提供 cmdline，这里保持为空
     hdr[576:608] = boot_id(kernel, ramdisk)
-    struct.pack_into("<I", hdr, 1632, 0)   # dtb_size：DTB 走独立文件
-    struct.pack_into("<Q", hdr, 1636, 0)
+    # v1 段：recovery_dtbo 不用；header_size 必须写真实长度（原厂 = 1660）。
+    struct.pack_into("<I", hdr, 1632, 0)          # recovery_dtbo_size
+    struct.pack_into("<Q", hdr, 1636, 0)          # recovery_dtbo_offset
+    struct.pack_into("<I", hdr, 1644, HEADER_SIZE)
+    # v2 段：dtb_size 是 u32@1648，dtb_addr 是 u64@1652（AOSP 结构体就是不对齐排的）。
+    struct.pack_into("<I", hdr, 1648, len(dtb))
+    if dtb:
+        struct.pack_into("<Q", hdr, 1652, DTB_ADDR)
     out = bytearray(hdr)
-    for blob in (kernel, ramdisk):
+    for blob in (kernel, ramdisk, dtb):
+        if not blob:
+            continue
         out += blob
         out += b"\0" * (-len(out) % PAGE)
     return bytes(out)
@@ -211,8 +234,13 @@ def parse_boot_image(data: bytes):
     kernel = data[off:off + ks]
     off += (ks + ps - 1) // ps * ps
     ramdisk = data[off:off + rs]
+    off += (rs + ps - 1) // ps * ps
+    dtb_size = struct.unpack_from("<I", data, 1648)[0]
+    dtb = data[off:off + dtb_size]
     return dict(kernel=kernel, ramdisk=ramdisk, header_version=hv, page_size=ps,
-                kernel_addr=ka, ramdisk_addr=ra)
+                kernel_addr=ka, ramdisk_addr=ra, header_size=struct.unpack_from("<I", data, 1644)[0],
+                dtb=dtb, dtb_size=dtb_size,
+                dtb_addr=struct.unpack_from("<Q", data, 1652)[0])
 
 
 # -------------------------------------------------------------------- main
@@ -239,10 +267,13 @@ def main() -> int:
         raise SystemExit("DTB totalsize 与文件长度不一致（不是完整合并 FDT）")
 
     entries = list(cpio_entries(debomb(a.ramdisk)))
-    # 上游归档以 TRAILER!!! 结尾；注入项必须落在它之前，否则内核解包到第一个
-    # TRAILER 就停，后面的文件等于没加（这个坑已经踩过一次）。
-    while entries and entries[-1]["name"] == "TRAILER!!!":
-        entries.pop()
+    # 每段归档都以 TRAILER!!! 收尾；注入项必须落在最后一个 TRAILER 之前，
+    # 否则内核解包到第一个 TRAILER 就停，后面的文件等于没加（这个坑已经踩过一次）。
+    # 多段拼接时中间也会有 TRAILER，所以全部去掉，最后统一补一个。
+    segments = sum(1 for e in entries if e["name"] == "TRAILER!!!")
+    entries = [e for e in entries if e["name"] != "TRAILER!!!"]
+    if segments > 1:
+        print(f"注意到 {segments} 段拼接 cpio，已合并为单段（顺序不变）", file=sys.stderr)
     orig_names = {e["name"] for e in entries}
     if "init" not in orig_names:
         raise SystemExit("上游 ramdisk 里没有 /init，无法在其之上做 shim（格式可能已变）")
@@ -285,11 +316,13 @@ def main() -> int:
     (stable / "Image").write_bytes(kernel)
     (stable / "board.dtb").write_bytes(dtb)
     (stable / "initramfs").write_bytes(ramdisk)
-    boot = build_boot_image(kernel, ramdisk)
+    boot = build_boot_image(kernel, ramdisk, dtb)
     (stable / "boot.img").write_bytes(boot)
 
     parsed = parse_boot_image(boot)
     assert parsed["kernel"] == kernel and parsed["ramdisk"] == ramdisk, "boot.img 回读不一致"
+    assert parsed["header_size"] == HEADER_SIZE, "header_size 未落到 1660"
+    assert parsed["dtb"] == dtb, "boot.img 内嵌 DTB 回读不一致"
 
     files = {}
     for name in ("Image", "board.dtb", "initramfs", "boot.img"):

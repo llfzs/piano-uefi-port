@@ -17,10 +17,11 @@
       "kernel_addr": "0x10008000",
       "ramdisk_addr": "0x11000000",
       "tags_addr": "0x10000100",
-      "dtb_size": 0,
-      "dtb_addr": "0x0",
+      "dtb_size": 1212784,
+      "dtb_addr": "0x11F00000",
       "cmdline": "",
-      "note": "DTB 与 cmdline 都不在 boot.img 里；固件从 board.dtb 与内置 cmdline 取"
+      "note": "原厂镜像 header_size=1660、dtb_size=1212784、dtb_addr=0x11F00000，并在 ramdisk 之后内嵌一份与 board.dtb 逐字节相同的 DTB；cmdline 为空。重打包时按这个布局原样复刻（dtb_size 是 u32@1648，dtb_addr 是 u64@1652）。",
+      "header_size": 1660
     }
   },
   "firmware_cmdline": "console=tty0 loglevel=4 consoleblank=0 fbcon=font:TER16x32 rdinit=/pianoinit piano.root=LABEL=PIANOROOT rootfstype=ext4 rootwait ro pd_ignore_unused clk_ignore_unused panic=0 iommu.passthrough=1",

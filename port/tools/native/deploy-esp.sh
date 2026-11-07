@@ -13,11 +13,18 @@ for f in Image board.dtb initramfs boot.img; do
     [ -f "$SRC/$f" ] || { echo "缺少 $SRC/$f" >&2; exit 1; }
 done
 
+# ESP 是 FAT32：cp -a 会带一堆 FAT 表达不了的时间戳/属性，用 -r 就够，
+# 而且首次部署时 DST 可能还不存在（cp 加 set -e 会直接退出）。
 mkdir -p "$BACKUP"
-cp -a "$DST"/. "$BACKUP"/
-( cd "$BACKUP" && sha256sum ./* > SHA256SUMS )
-echo "已备份到 $BACKUP"
+if [ -d "$DST" ] && [ -n "$(ls -A "$DST" 2>/dev/null)" ]; then
+    cp -r "$DST"/. "$BACKUP"/
+    ( cd "$BACKUP" && sha256sum ./* > SHA256SUMS )
+    echo "已备份到 $BACKUP"
+else
+    echo "警告：$DST 为空或不存在，没有旧文件可备份（首次部署）" >&2
+fi
 
+mkdir -p "$DST"
 for f in Image board.dtb initramfs boot.img; do
     cp "$SRC/$f" "$DST/$f"
 done

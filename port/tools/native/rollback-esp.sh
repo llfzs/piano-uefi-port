@@ -10,6 +10,15 @@ DST=/boot/efi/EFI/Piano/stable
 
 for f in Image board.dtb initramfs boot.img; do
     [ -f "$SRC/$f" ] || { echo "备份里缺少 $f" >&2; exit 1; }
+done
+
+# 有清单就先校验，避免拿半截/损坏的备份把 ESP 写坏。
+if [ -f "$SRC/SHA256SUMS" ]; then
+    ( cd "$SRC" && sha256sum -c SHA256SUMS ) || { echo "备份校验失败，未写入" >&2; exit 1; }
+fi
+
+mkdir -p "$DST"
+for f in Image board.dtb initramfs boot.img; do
     cp "$SRC/$f" "$DST/$f"
 done
 sync

@@ -13,16 +13,26 @@
 | 文件 | 本机实测 | 说明 |
 | --- | --- | --- |
 | `Image` | 48 MB，`MZ` 头 | EFI Stub 内核，固件直接加载 |
-| `board.dtb` | 1.2 MB，完整合并 FDT | 独立文件，不在 boot.img 里 |
+| `board.dtb` | 1.2 MB，完整合并 FDT | 独立文件；同一份内容**也内嵌在 boot.img 尾部**（原厂如此） |
 | `initramfs` | 3.1 MB gzip cpio | 早期用户态 |
-| `boot.img` | `ANDROID!`，header v2 | **只装 kernel+ramdisk**：`dtb_size=0`、`cmdline` 为空 |
+| `boot.img` | `ANDROID!`，header v2 | kernel + ramdisk + 内嵌 DTB（1,212,784 B）；`cmdline` 为空 |
 
 `boot.img` 头参数（从设备读出，重打包时原样沿用）：
 
 ```
 page_size=4096  kernel_addr=0x10008000  ramdisk_addr=0x11000000  tags_addr=0x10000100
-header_version=2  dtb_size=0  cmdline=""
+header_version=2  header_size=1660  cmdline=""
+
+@1632 recovery_dtbo_size=0   @1636 recovery_dtbo_offset=0
+@1644 header_size=1660
+@1648 dtb_size=1212784 (u32) @1652 dtb_addr=0x11F00000 (u64, AOSP 结构体就是这么不对齐排的)
 ```
+
+原厂 `boot.img` 尾部内嵌的 DTB 与 `board.dtb` **逐字节相同**（实测 sha256 一致）。
+早先以为 `dtb_size=0`、DTB 只走独立文件，是**读错了偏移**：1632 是
+`recovery_dtbo_size`，v2 的 `dtb_size` 在 1648。重打包时必须照着原厂把
+`header_size`、`dtb_size`、`dtb_addr` 写全并内嵌 DTB——否则按头长度定位
+kernel/ramdisk 的 bootloader 会解析错位。
 
 固件 cmdline **编译在固件里**，ESP 里没有 cmdline 文件。设备上 `cat /proc/cmdline` 的实测值：
 

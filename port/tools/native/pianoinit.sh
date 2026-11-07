@@ -6,9 +6,12 @@
 # 把固件带的 ro 改成 rw，补两个上游有而固件没有的参数，
 # 然后把控制权交回上游 /init（PID 1 不变，systemd 照常接管）。
 #
-# 上游 initramfs 里没有 mountpoint（只有 util-linux 的 mount），也不保证有 sed，
-# 所以下面只用 shell 内建语法，不依赖任何外部命令。
+# 上游 initramfs 里没有 mountpoint（util-linux 只装了 mount），但有 dash 内建语法的
+# 全部能力，所以下面只用 shell 内建，不依赖 grep/sed/mountpoint。
+# cmdline 用 `for arg in $(cat ...)` 按空白切分是有意的；关掉路径名展开，避免
+# cmdline 里出现 `*` 之类的字符时被 glob 改写。
 set -eu
+set -f
 
 # 内核还没挂 /proc 时，/proc/cmdline 读不到。
 [ -r /proc/cmdline ] || { mkdir -p /proc; mount -t proc proc /proc; }

@@ -149,6 +149,10 @@ def set_dir_entry(entry: bytearray, first_cluster: int, size: int) -> None:
     struct.pack_into("<H", entry, 26, first_cluster & 0xFFFF)
 
 
+def first_cluster(entry: bytes) -> int:
+    return (struct.unpack_from("<H", entry, 20)[0] << 16) | struct.unpack_from("<H", entry, 26)[0]
+
+
 def set_fat(fat: bytearray, cluster: int, value: int) -> None:
     struct.pack_into("<I", fat, cluster * 4, value & 0x0FFFFFFF)
 
@@ -171,26 +175,50 @@ def build(template: Path, source: Path, output: Path) -> None:
     if template.stat().st_size != total_size:
         sys.exit(f"模板大小 {template.stat().st_size} 与引导扇区声明的 {total_size} 不符")
 
+    dirs: list[tuple[list[int], bytes]] = []
     with template.open("rb") as fh:
-        root_raw = read_cluster_chain(fh, geom, fat, geom.root_cluster)
+
+        def load_dir(cluster: int) -> bytes:
+            chain = chain_of(fat, cluster)
+            if not chain:
+                sys.exit(f"模板目录簇 {cluster} 的 FAT 链为空")
+            raw = read_cluster_chain(fh, geom, fat, cluster)
+            if len(raw) < len(chain) * geom.cluster_bytes:
+                sys.exit(f"模板目录簇 {cluster} 的链不完整")
+            dirs.append((chain, raw))
+            return raw
+
+        root_raw = load_dir(geom.root_cluster)
         _, efi_entry, _ = find_entry(root_raw, "EFI")
-        efi_cluster = struct.unpack_from("<H", efi_entry, 20)[0] << 16 | struct.unpack_from("<H", efi_entry, 26)[0]
-        efi_raw = read_cluster_chain(fh, geom, fat, efi_cluster)
+        efi_cluster = first_cluster(efi_entry)
+        efi_raw = load_dir(efi_cluster)
         _, piano_entry, _ = find_entry(efi_raw, "Piano")
-        piano_cluster = struct.unpack_from("<H", piano_entry, 20)[0] << 16 | struct.unpack_from("<H", piano_entry, 26)[0]
-        piano_raw = read_cluster_chain(fh, geom, fat, piano_cluster)
+        piano_cluster = first_cluster(piano_entry)
+        piano_raw = load_dir(piano_cluster)
         _, stable_entry, _ = find_entry(piano_raw, "stable")
-        stable_cluster = struct.unpack_from("<H", stable_entry, 20)[0] << 16 | struct.unpack_from("<H", stable_entry, 26)[0]
-        stable_raw = bytearray(read_cluster_chain(fh, geom, fat, stable_cluster))
+        stable_cluster = first_cluster(stable_entry)
+        stable_raw = bytearray(load_dir(stable_cluster))
 
     # 目录簇沿用模板里的编号，目录项本身也照抄，只改四个文件的大小和起始簇。
-    new_fat = bytearray(geom.fat_sectors * geom.bytes_per_sector * geom.fat_count)
+    # FAT 只准备一份，写盘时复制到每个副本（模板是 2 份，第二份漏写会让 fsck /
+    # 读第二份的固件看到全零表）。
+    fat_bytes = geom.fat_sectors * geom.bytes_per_sector
+    new_fat = bytearray(fat_bytes)
     set_fat(new_fat, 0, 0x0FFFFFF8)
     set_fat(new_fat, 1, 0x0FFFFFFF)
-    for cluster in (geom.root_cluster, efi_cluster, piano_cluster, stable_cluster):
-        set_fat(new_fat, cluster, 0x0FFFFFFF)
+    for chain, _ in dirs:
+        for index, cluster in enumerate(chain):
+            last = index + 1 == len(chain)
+            set_fat(new_fat, cluster, 0x0FFFFFFF if last else chain[index + 1])
 
-    next_free = 6
+    # 新文件的起始簇必须落在模板实际用过的簇之后，不能写死常数：模板里的目录簇
+    # 一旦不是 2..5，写死就会让文件数据覆盖目录，回读时报「找不到目录条目」。
+    used_in_template = [
+        c for c in range(2, geom.cluster_count + 2)
+        if struct.unpack_from("<I", fat, c * 4)[0] & 0x0FFFFFFF
+    ]
+    next_free = (max(used_in_template) + 1) if used_in_template else 2
+
     payload: list[tuple[int, bytes]] = []
     for name in FILES:
         path = source / SUBDIR / name
@@ -214,18 +242,34 @@ def build(template: Path, source: Path, output: Path) -> None:
     if next_free > geom.cluster_count + 2:
         sys.exit(f"内容超出 ESP 容量：需要到簇 {next_free}，只有 {geom.cluster_count + 2}")
 
+    # stable 目录项被就地改过，写盘时要写改后的版本（dirs 里存的是读取时的字节）。
+    for index, (chain, _) in enumerate(dirs):
+        if chain and chain[0] == stable_cluster:
+            dirs[index] = (chain, bytes(stable_raw))
+            break
+    else:
+        sys.exit("内部错误：dirs 里没有 stable 目录")
+
     # 引导扇区 + 保留扇区（含 FSInfo）逐字节照抄模板。
     reserved = geom.reserved_sectors * geom.bytes_per_sector
     with template.open("rb") as fh:
         fh.seek(0)
         head = fh.read(reserved)
 
+    used = sum(
+        1 for c in range(2, geom.cluster_count + 2)
+        if struct.unpack_from("<I", new_fat, c * 4)[0] & 0x0FFFFFFF
+    )
+    free_first = next(
+        (c for c in range(2, geom.cluster_count + 2) if not struct.unpack_from("<I", new_fat, c * 4)[0] & 0x0FFFFFFF),
+        0xFFFFFFFF,
+    )
     fsinfo_offset = geom.fsinfo_sector * geom.bytes_per_sector
     fsinfo = bytearray(head[fsinfo_offset : fsinfo_offset + geom.bytes_per_sector])
     if struct.unpack_from("<I", fsinfo, 0)[0] == 0x41615252:
-        used = next_free - 2
+        # FSInfo 布局：lead@0，struc_sig@484，Free_Count@488，Nxt_Free@492，trail@508。
         struct.pack_into("<I", fsinfo, 488, geom.cluster_count - used)
-        struct.pack_into("<I", fsinfo, 492, next_free)
+        struct.pack_into("<I", fsinfo, 492, free_first)
     head = head[:fsinfo_offset] + bytes(fsinfo) + head[fsinfo_offset + geom.bytes_per_sector :]
 
     # 只写用到的簇，其余留空洞（NTFS 上是稀疏文件，不占实际磁盘）。
@@ -233,16 +277,14 @@ def build(template: Path, source: Path, output: Path) -> None:
         out.truncate(total_size)
         out.seek(0)
         out.write(head)
-        out.write(bytes(new_fat))
-        for cluster in (geom.root_cluster,):
-            out.seek(geom.cluster_offset(cluster))
-            out.write(root_raw[: geom.cluster_bytes])
-        out.seek(geom.cluster_offset(efi_cluster))
-        out.write(efi_raw[: geom.cluster_bytes])
-        out.seek(geom.cluster_offset(piano_cluster))
-        out.write(piano_raw[: geom.cluster_bytes])
-        out.seek(geom.cluster_offset(stable_cluster))
-        out.write(bytes(stable_raw))
+        for copy in range(geom.fat_count):
+            out.seek(geom.fat_offset + copy * fat_bytes)
+            out.write(bytes(new_fat))
+        for chain, raw in dirs:
+            for index, cluster in enumerate(chain):
+                out.seek(geom.cluster_offset(cluster))
+                start = index * geom.cluster_bytes
+                out.write(raw[start : start + geom.cluster_bytes])
         for first, data in payload:
             out.seek(geom.cluster_offset(first))
             out.write(data)
@@ -257,13 +299,13 @@ def verify(image: Path, source: Path) -> int:
         fat = read_fat(image, geom)
         root_raw = read_cluster_chain(fh, geom, fat, geom.root_cluster)
         _, efi_entry, _ = find_entry(root_raw, "EFI")
-        efi_cluster = struct.unpack_from("<H", efi_entry, 20)[0] << 16 | struct.unpack_from("<H", efi_entry, 26)[0]
+        efi_cluster = first_cluster(efi_entry)
         efi_raw = read_cluster_chain(fh, geom, fat, efi_cluster)
         _, piano_entry, _ = find_entry(efi_raw, "Piano")
-        piano_cluster = struct.unpack_from("<H", piano_entry, 20)[0] << 16 | struct.unpack_from("<H", piano_entry, 26)[0]
+        piano_cluster = first_cluster(piano_entry)
         piano_raw = read_cluster_chain(fh, geom, fat, piano_cluster)
         _, stable_entry, _ = find_entry(piano_raw, "stable")
-        stable_cluster = struct.unpack_from("<H", stable_entry, 20)[0] << 16 | struct.unpack_from("<H", stable_entry, 26)[0]
+        stable_cluster = first_cluster(stable_entry)
         stable_raw = read_cluster_chain(fh, geom, fat, stable_cluster)
 
         failures = 0
@@ -281,6 +323,30 @@ def verify(image: Path, source: Path) -> int:
 
         used = sum(1 for c in range(2, geom.cluster_count + 2) if struct.unpack_from("<I", fat, c * 4)[0] & 0x0FFFFFFF)
         print(f"  已用簇 {used} / {geom.cluster_count}（{used * geom.cluster_bytes / 2**20:.1f} MiB）")
+
+        # 多副本 FAT 必须逐字节一致；只读第一份的自校验发现不了第二份是空的。
+        copies = []
+        for index in range(geom.fat_count):
+            fh.seek(geom.fat_offset + index * geom.fat_sectors * geom.bytes_per_sector)
+            copies.append(fh.read(geom.fat_sectors * geom.bytes_per_sector))
+        if any(copy != copies[0] for copy in copies[1:]):
+            print(f"  FAIL {geom.fat_count} 份 FAT 不一致")
+            failures += 1
+        else:
+            print(f"  OK   {geom.fat_count} 份 FAT 一致")
+
+        # FSInfo 的 Free_Count / Nxt_Free 与实际 FAT 对账。
+        fh.seek(geom.fsinfo_sector * geom.bytes_per_sector)
+        fsinfo = fh.read(geom.bytes_per_sector)
+        free_count, nxt_free = struct.unpack_from("<2I", fsinfo, 488)
+        want_free = geom.cluster_count - used
+        first_free = next(
+            (c for c in range(2, geom.cluster_count + 2) if not struct.unpack_from("<I", fat, c * 4)[0] & 0x0FFFFFFF),
+            0xFFFFFFFF,
+        )
+        ok = free_count == want_free and nxt_free == first_free
+        print(f"  {'OK  ' if ok else 'FAIL'} FSInfo Free_Count={free_count}（应 {want_free}）Nxt_Free={nxt_free}（应 {first_free}）")
+        failures += 0 if ok else 1
         return failures
 
 
